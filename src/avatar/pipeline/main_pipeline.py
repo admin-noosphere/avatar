@@ -185,35 +185,75 @@ class AvatarPipeline:
         stt = self.create_stt()
         llm = self.create_llm()
         tts = self.create_tts()
-        unreal_events, unreal_audio = self.create_unreal_processors()
-        ndi_processor = self.create_ndi_processor()
 
         # Create context and aggregators
         context = self.create_context()
         context_aggregator = llm.create_context_aggregator(context)
 
-        # Build pipeline with ParallelPipeline for dual output
-        # TTS output goes to both:
-        #   - Branch A: NDI video/audio from Unreal → Daily transport (user sees/hears avatar)
-        #   - Branch B: Unreal Engine (avatar lip-sync + events)
-        pipeline = Pipeline(
-            [
-                transport.input(),
-                stt,
-                context_aggregator.user(),
-                llm,
-                tts,
-                ParallelPipeline(
-                    [ndi_processor, transport.output()],  # Branch A: NDI → Daily
-                    [unreal_events, unreal_audio],  # Branch B: Unreal control
-                ),
-                context_aggregator.assistant(),
-            ]
-        )
+        # Determine pipeline structure based on feature toggles
+        if self.settings.enable_unreal or self.settings.enable_ndi:
+            # Full pipeline with ParallelPipeline
+            branches = []
 
-        logger.info("Pipeline built with ParallelPipeline")
-        logger.info(f"  - Branch A: NDI → Daily transport (video + audio)")
-        logger.info(f"  - Branch B: Unreal control (WebSocket + UDP)")
+            # Branch A: NDI → Daily (if enabled)
+            if self.settings.enable_ndi:
+                ndi_processor = self.create_ndi_processor()
+                branches.append([ndi_processor, transport.output()])
+                logger.info("  - Branch A: NDI → Daily transport (video + audio)")
+            else:
+                # No NDI - just send TTS audio to Daily
+                branches.append([transport.output()])
+                logger.info("  - Branch A: Direct TTS → Daily transport (audio only)")
+
+            # Branch B: Unreal control (if enabled)
+            if self.settings.enable_unreal:
+                unreal_events, unreal_audio = self.create_unreal_processors()
+                branches.append([unreal_events, unreal_audio])
+                logger.info("  - Branch B: Unreal control (WebSocket + UDP)")
+
+            # Build with ParallelPipeline only if we have multiple branches
+            if len(branches) > 1:
+                pipeline = Pipeline(
+                    [
+                        transport.input(),
+                        stt,
+                        context_aggregator.user(),
+                        llm,
+                        tts,
+                        ParallelPipeline(*branches),
+                        context_aggregator.assistant(),
+                    ]
+                )
+                logger.info("Pipeline built with ParallelPipeline")
+            else:
+                # Single branch - no need for ParallelPipeline
+                pipeline = Pipeline(
+                    [
+                        transport.input(),
+                        stt,
+                        context_aggregator.user(),
+                        llm,
+                        tts,
+                        *branches[0],
+                        context_aggregator.assistant(),
+                    ]
+                )
+                logger.info("Pipeline built (single branch)")
+        else:
+            # Core only - no Unreal, no NDI
+            # Simple pipeline: Daily → STT → LLM → TTS → Daily
+            pipeline = Pipeline(
+                [
+                    transport.input(),
+                    stt,
+                    context_aggregator.user(),
+                    llm,
+                    tts,
+                    transport.output(),
+                    context_aggregator.assistant(),
+                ]
+            )
+            logger.info("Pipeline built (core only - no Unreal/NDI)")
 
         return pipeline
 
@@ -241,10 +281,15 @@ class AvatarPipeline:
         logger.info("  Avatar MetaHuman Pipeline - Starting")
         logger.info("=" * 60)
         logger.info(f"Daily Room: {self.settings.daily_room_url}")
-        logger.info(f"Unreal WebSocket: {self.settings.unreal_websocket_uri}")
-        logger.info(f"Unreal UDP: {self.settings.unreal_audio_udp_host}:{self.settings.unreal_audio_udp_port}")
         logger.info(f"TTS Model: {self.settings.elevenlabs_model}")
         logger.info(f"LLM Model: {self.settings.llm_model}")
+        logger.info(f"Enable Unreal: {self.settings.enable_unreal}")
+        logger.info(f"Enable NDI: {self.settings.enable_ndi}")
+        if self.settings.enable_unreal:
+            logger.info(f"  Unreal WebSocket: {self.settings.unreal_websocket_uri}")
+            logger.info(f"  Unreal UDP: {self.settings.unreal_audio_udp_host}:{self.settings.unreal_audio_udp_port}")
+        if self.settings.enable_ndi:
+            logger.info(f"  NDI Source: {self.settings.ndi_source_name}")
         logger.info("=" * 60)
 
         # Build pipeline
@@ -268,11 +313,16 @@ class AvatarPipeline:
             user_name = participant.get("info", {}).get("userName", "Unknown")
             logger.info(f"First participant joined: {user_name}")
 
-            # Start NDI reception from Unreal
-            if self.ndi_processor:
+            # Start NDI reception from Unreal (if enabled)
+            if self.settings.enable_ndi and self.ndi_processor:
                 logger.info("Starting NDI reception from Unreal...")
                 await self.ndi_processor.start_ndi()
                 logger.info("NDI started - Video + Audio streaming")
+
+            # Start Unreal audio streamer (if enabled)
+            if self.settings.enable_unreal and self.unreal_audio:
+                await self.unreal_audio.start()
+                logger.info("Unreal audio streamer started")
 
             # Send welcome message
             from pipecat.frames.frames import TTSSpeakFrame

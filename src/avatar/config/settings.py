@@ -192,6 +192,18 @@ class Settings(BaseSettings):
         description="Use mock Unreal server for testing",
     )
 
+    # =========================================================================
+    # Feature Toggles (for testing core without Unreal)
+    # =========================================================================
+    enable_unreal: bool = Field(
+        default=True,
+        description="Enable Unreal Engine integration (WebSocket + UDP audio)",
+    )
+    enable_ndi: bool = Field(
+        default=True,
+        description="Enable NDI video/audio from Unreal",
+    )
+
     def validate_audio2face_settings(self) -> None:
         """Validate that audio settings are compatible with Audio2Face."""
         valid_sample_rates = [16000, 22050, 24000, 44100]
