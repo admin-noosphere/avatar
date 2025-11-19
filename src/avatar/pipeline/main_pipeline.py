@@ -23,7 +23,8 @@ from pipecat.pipeline.runner import PipelineRunner
 from pipecat.pipeline.task import PipelineParams, PipelineTask
 from pipecat.processors.aggregators.openai_llm_context import OpenAILLMContext
 from pipecat.audio.vad.silero import SileroVADAnalyzer
-from pipecat.transports.services.daily import DailyParams, DailyTransport
+from pipecat.audio.vad.vad_analyzer import VADParams
+from pipecat.transports.daily.transport import DailyParams, DailyTransport
 
 # Services
 from pipecat.services.openai.stt import OpenAISTTService
@@ -86,7 +87,12 @@ class AvatarPipeline:
                 video_out_height=1080,
                 video_out_framerate=30,
                 vad_analyzer=SileroVADAnalyzer(
-                    params={"threshold": 0.5, "min_speech_duration_ms": 200}
+                    params=VADParams(
+                        confidence=0.5,
+                        start_secs=0.2,
+                        stop_secs=0.5,
+                        min_volume=0.5,
+                    )
                 ),
                 vad_audio_passthrough=True,
             ),
