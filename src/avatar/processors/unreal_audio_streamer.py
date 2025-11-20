@@ -335,6 +335,10 @@ class UnrealAudioStreamer(FrameProcessor):
                     f"+{audio_len} bytes | "
                     f"Total: {target.audio_bytes} bytes ({target.audio_duration_ms:.0f}ms)"
                 )
+
+                # Start playback task if not running (will wait for complete or timeout)
+                if not self._is_playing and not self._playback_task:
+                    self._playback_task = asyncio.create_task(self._play_queue())
             else:
                 logger.warning(
                     f"⚠️ Audio chunk received but no active utterance! "
@@ -429,6 +433,10 @@ class UnrealAudioStreamer(FrameProcessor):
         """Play all complete utterances in the queue sequentially."""
         self._is_playing = True
 
+        # Timeout for waiting for incomplete utterances to complete
+        # If TTSStoppedFrame doesn't arrive within this time, play what we have
+        incomplete_timeout = 2.0  # seconds
+
         try:
             while True:
                 # Find next complete utterance (don't pop yet - keep for late chunks)
@@ -441,16 +449,31 @@ class UnrealAudioStreamer(FrameProcessor):
                         break
 
                 if not utterance:
-                    # No complete utterance, wait a bit and check again
-                    await asyncio.sleep(0.01)
+                    # No complete utterance, check for incomplete ones that timed out
+                    now = time.monotonic()
+                    for i, utt in enumerate(self._utterance_queue):
+                        if not utt.is_complete and utt.audio_data:
+                            # Check if this utterance has been waiting too long
+                            wait_time = now - utt.created_at
+                            if wait_time > incomplete_timeout:
+                                # Play it anyway - TTSStoppedFrame probably won't come
+                                logger.warning(
+                                    f"⚠️ Utterance #{utt.utterance_id} incomplete after {wait_time:.1f}s, "
+                                    f"playing {utt.audio_bytes} bytes anyway"
+                                )
+                                utt.is_complete = True
+                                utt.completed_at = now
+                                utterance = utt
+                                utterance_index = i
+                                break
 
-                    # Check if there are any incomplete utterances
-                    has_incomplete = any(not u.is_complete for u in self._utterance_queue)
-                    if not has_incomplete:
-                        # Queue is empty
-                        if not self._utterance_queue:
-                            break
-                        continue
+                if not utterance:
+                    # Still no utterance to play, wait a bit
+                    await asyncio.sleep(0.05)
+
+                    # Check if queue is empty
+                    if not self._utterance_queue:
+                        break
                     continue
 
                 # Play this utterance
@@ -492,18 +515,18 @@ class UnrealAudioStreamer(FrameProcessor):
         # ═══════════════════════════════════════════════════════════════
         # SEND START EVENTS - Just before UDP audio
         # ═══════════════════════════════════════════════════════════════
-        await self._send_ws_command({
+        if await self._send_ws_command({
             "type": "start_speaking",
             "category": "SPEAKING_NEUTRAL",
             "timestamp": time.time(),
-        })
-        logger.info("✅ start_speaking sent (just before UDP)")
+        }):
+            logger.info("✅ start_speaking sent (just before UDP)")
 
-        await self._send_ws_command({
+        if await self._send_ws_command({
             "type": "start_audio_stream",
             "timestamp": time.time(),
-        })
-        logger.info("✅ start_audio_stream sent (just before UDP)")
+        }):
+            logger.info("✅ start_audio_stream sent (just before UDP)")
 
         # Send audio in UDP packets
         packets_sent = 0
@@ -547,17 +570,17 @@ class UnrealAudioStreamer(FrameProcessor):
         # ═══════════════════════════════════════════════════════════════
         # SEND STOP EVENTS - Just after UDP audio completes
         # ═══════════════════════════════════════════════════════════════
-        await self._send_ws_command({
+        if await self._send_ws_command({
             "type": "end_audio_stream",
             "timestamp": time.time(),
-        })
-        logger.info("✅ end_audio_stream sent (after UDP complete)")
+        }):
+            logger.info("✅ end_audio_stream sent (after UDP complete)")
 
-        await self._send_ws_command({
+        if await self._send_ws_command({
             "type": "stop_speaking",
             "timestamp": time.time(),
-        })
-        logger.info("✅ stop_speaking sent (after UDP complete)")
+        }):
+            logger.info("✅ stop_speaking sent (after UDP complete)")
 
         # Forward the stop frame downstream
         await self.push_frame(TTSStoppedFrame(), utterance.direction)
