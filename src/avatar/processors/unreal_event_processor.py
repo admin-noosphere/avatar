@@ -141,59 +141,32 @@ class UnrealEventProcessor(FrameProcessor):
     ) -> None:
         """Process incoming frames and send WebSocket events.
 
+        NOTE: In the current architecture, UnrealAudioStreamer handles the WebSocket
+        events for start_speaking/stop_speaking to ensure proper timing with UDP audio.
+        This processor is kept for backward compatibility and handles interruptions
+        that may bypass the audio streamer.
+
         Args:
             frame: The frame to process.
             direction: The direction of frame flow (upstream/downstream).
         """
         await super().process_frame(frame, direction)
 
-        # Log all frames for debugging
+        # Log certain frames for debugging
         frame_type = type(frame).__name__
-        if frame_type in ['TTSStartedFrame', 'TTSStoppedFrame', 'OutputAudioRawFrame']:
-            logger.info(f"UnrealEventProcessor received: {frame_type}")
+        if frame_type in ['TTSStartedFrame', 'TTSStoppedFrame']:
+            logger.debug(f"UnrealEventProcessor received: {frame_type} (events handled by AudioStreamer)")
 
-        # Handle TTS Started - Avatar starts speaking
-        if isinstance(frame, TTSStartedFrame):
-            # Send start_speaking with category and timestamp
-            sent = await self._send_command({
-                "type": "start_speaking",
-                "category": "SPEAKING_NEUTRAL",
-                "timestamp": time.time(),
-            })
-            if sent:
-                logger.info("✅ start_speaking sent")
-            else:
-                logger.info("⏳ start_speaking queued (will send when connected)")
-
-            # Send start_audio_stream
-            sent = await self._send_command({
-                "type": "start_audio_stream",
-                "timestamp": time.time(),
-            })
-            if sent:
-                logger.info("✅ start_audio_stream sent")
-
-        # Handle TTS Stopped - Avatar stops speaking
-        elif isinstance(frame, TTSStoppedFrame):
-            # Send end_audio_stream
-            sent = await self._send_command({
-                "type": "end_audio_stream",
-                "timestamp": time.time(),
-            })
-            if sent:
-                logger.info("✅ end_audio_stream sent")
-
-            # Send stop_speaking
-            sent = await self._send_command({
-                "type": "stop_speaking",
-                "timestamp": time.time(),
-            })
-            if sent:
-                logger.info("✅ stop_speaking sent")
+        # NOTE: TTSStartedFrame and TTSStoppedFrame events are now handled by
+        # UnrealAudioStreamer to ensure proper timing with UDP audio.
+        # We only handle interruptions here as a safety net.
 
         # Handle User Interruption (barge-in) - Immediately stop avatar
-        elif isinstance(frame, (InterruptionFrame, CancelFrame)):
-            logger.info(f"🛑 INTERRUPTION received: {type(frame).__name__}")
+        # This is a safety net in case interruption bypasses the audio streamer
+        if isinstance(frame, (InterruptionFrame, CancelFrame)):
+            logger.info(f"🛑 EventProcessor: INTERRUPTION received: {type(frame).__name__}")
+            # Note: UnrealAudioStreamer should have already sent these, but we send again
+            # as a safety net to ensure Unreal gets the stop signal
             await self._send_command({
                 "type": "end_audio_stream",
                 "timestamp": time.time(),
@@ -203,7 +176,7 @@ class UnrealEventProcessor(FrameProcessor):
                 "timestamp": time.time(),
             })
             if sent:
-                logger.info("✅ stop_speaking sent (interruption)")
+                logger.info("✅ stop_speaking sent (interruption - safety net)")
 
         # Forward frame downstream
         await self.push_frame(frame, direction)

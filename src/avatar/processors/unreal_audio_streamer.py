@@ -6,19 +6,28 @@ buffer via UDP to ensure coherent audio stream to Audio2Face.
 Flow:
 1. TTSStartedFrame → Create new utterance buffer
 2. OutputAudioRawFrame → Accumulate in buffer (don't send yet)
-3. TTSStoppedFrame → Play ENTIRE buffer via UDP, then send stop event
+3. TTSStoppedFrame → Play ENTIRE buffer via UDP, with WebSocket events
 
-This ensures Unreal receives complete, uninterrupted audio with exact duration.
+WebSocket events are sent at the RIGHT time:
+- start_speaking/start_audio_stream → Just before UDP audio
+- end_audio_stream/stop_speaking → Just after UDP audio completes
+
+This ensures Unreal receives complete, uninterrupted audio with exact duration
+and properly synchronized WebSocket control events for Audio2Face.
 """
 
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 import socket
 import time
 from dataclasses import dataclass, field
 from typing import Any
+
+import websockets
+from websockets.exceptions import ConnectionClosed, WebSocketException
 
 from pipecat.frames.frames import (
     Frame,
@@ -82,6 +91,7 @@ class UnrealAudioStreamer(FrameProcessor):
         self,
         host: str = "192.168.1.14",
         port: int = 8080,
+        websocket_uri: str = "ws://192.168.1.14:8765",
         playback_speed: float = 1.0,  # For simulating real-time playback
         **kwargs: Any,
     ) -> None:
@@ -90,16 +100,23 @@ class UnrealAudioStreamer(FrameProcessor):
         Args:
             host: UDP target host for Audio2Face.
             port: UDP target port for Audio2Face.
+            websocket_uri: WebSocket URI for Unreal Engine events.
             playback_speed: Speed multiplier for UDP sending (1.0 = real-time).
             **kwargs: Additional arguments passed to FrameProcessor.
         """
         super().__init__(**kwargs)
         self.host = host
         self.port = port
+        self.websocket_uri = websocket_uri
         self._target = (host, port)
         self._playback_speed = playback_speed
 
         self._socket: socket.socket | None = None
+
+        # WebSocket for Unreal events
+        self._websocket: websockets.WebSocketClientProtocol | None = None
+        self._ws_connection_task: asyncio.Task[None] | None = None
+        self._ws_running = False
 
         # Statistics
         self._total_bytes_sent = 0
@@ -121,7 +138,8 @@ class UnrealAudioStreamer(FrameProcessor):
         self._max_history = 20
 
     async def start(self) -> None:
-        """Start the processor and create UDP socket."""
+        """Start the processor, create UDP socket, and connect WebSocket."""
+        # UDP socket
         self._socket = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         self._socket.setblocking(False)
 
@@ -141,10 +159,14 @@ class UnrealAudioStreamer(FrameProcessor):
         self._utterance_queue = []
         self._is_playing = False
 
-        logger.info(f"🎙️ UnrealAudioStreamer started → {self.host}:{self.port}")
+        # Start WebSocket connection
+        self._ws_running = True
+        self._ws_connection_task = asyncio.create_task(self._maintain_ws_connection())
+
+        logger.info(f"🎙️ UnrealAudioStreamer started → UDP {self.host}:{self.port}, WS {self.websocket_uri}")
 
     async def stop(self) -> None:
-        """Stop the processor and close UDP socket."""
+        """Stop the processor and close connections."""
         # Cancel any playback task
         if self._playback_task:
             self._playback_task.cancel()
@@ -154,6 +176,21 @@ class UnrealAudioStreamer(FrameProcessor):
                 pass
             self._playback_task = None
 
+        # Stop WebSocket
+        self._ws_running = False
+        if self._ws_connection_task:
+            self._ws_connection_task.cancel()
+            try:
+                await self._ws_connection_task
+            except asyncio.CancelledError:
+                pass
+            self._ws_connection_task = None
+
+        if self._websocket:
+            await self._websocket.close()
+            self._websocket = None
+
+        # Close UDP socket
         if self._socket:
             self._socket.close()
             self._socket = None
@@ -165,6 +202,68 @@ class UnrealAudioStreamer(FrameProcessor):
             f"Dropped: {self._total_packets_dropped} | "
             f"Total: {self._total_bytes_sent / 1024:.1f} KB"
         )
+
+    async def _maintain_ws_connection(self) -> None:
+        """Maintain persistent WebSocket connection with exponential backoff."""
+        reconnect_delay = 1.0
+        max_delay = 30.0
+
+        while self._ws_running:
+            try:
+                async with websockets.connect(
+                    self.websocket_uri,
+                    ping_interval=20,
+                    ping_timeout=10,
+                ) as ws:
+                    self._websocket = ws
+                    reconnect_delay = 1.0  # Reset backoff
+                    logger.info(f"✅ WebSocket connected to {self.websocket_uri}")
+
+                    # Wait until connection closes
+                    await ws.wait_closed()
+                    logger.warning("WebSocket connection closed")
+
+            except ConnectionClosed as e:
+                logger.warning(f"WebSocket connection closed: {e.code} - {e.reason}")
+            except WebSocketException as e:
+                logger.error(f"WebSocket error: {e}")
+            except OSError as e:
+                logger.error(f"WebSocket connection failed: {e}")
+            except asyncio.CancelledError:
+                break
+            finally:
+                self._websocket = None
+
+            if self._ws_running:
+                logger.info(f"WebSocket reconnecting in {reconnect_delay:.1f}s...")
+                await asyncio.sleep(reconnect_delay)
+                reconnect_delay = min(reconnect_delay * 2, max_delay)
+
+    async def _send_ws_command(self, data: dict[str, Any]) -> bool:
+        """Send a JSON command to Unreal Engine via WebSocket.
+
+        Args:
+            data: Dictionary to serialize and send as JSON.
+
+        Returns:
+            True if sent successfully, False otherwise.
+        """
+        if not self._websocket:
+            logger.warning(f"⏳ WebSocket not connected, cannot send: {data.get('type')}")
+            return False
+
+        try:
+            message = json.dumps(data)
+            await self._websocket.send(message)
+            logger.debug(f"📤 Sent to Unreal: {message}")
+            return True
+        except ConnectionClosed:
+            logger.warning("Cannot send: WebSocket connection closed")
+            self._websocket = None
+            return False
+        except WebSocketException as e:
+            logger.error(f"Failed to send WebSocket command: {e}")
+            return False
 
     async def process_frame(
         self, frame: Frame, direction: FrameDirection
@@ -302,7 +401,18 @@ class UnrealAudioStreamer(FrameProcessor):
             self._utterance_queue = []
             self._is_playing = False
 
-            # Forward interruption to EventProcessor so it sends stop_speaking
+            # Send stop events via WebSocket immediately
+            await self._send_ws_command({
+                "type": "end_audio_stream",
+                "timestamp": time.time(),
+            })
+            await self._send_ws_command({
+                "type": "stop_speaking",
+                "timestamp": time.time(),
+            })
+            logger.info("✅ Interruption: stop events sent")
+
+            # Forward interruption downstream
             await self.push_frame(frame, direction)
 
         # ═══════════════════════════════════════════════════════════════
@@ -357,7 +467,7 @@ class UnrealAudioStreamer(FrameProcessor):
             self._is_playing = False
 
     async def _play_utterance(self, utterance: Utterance) -> None:
-        """Play a single utterance via UDP.
+        """Play a single utterance via UDP with WebSocket events.
 
         Args:
             utterance: The complete utterance to play.
@@ -378,6 +488,22 @@ class UnrealAudioStreamer(FrameProcessor):
             f"{utterance.audio_duration_ms:.0f}ms | "
             f"{utterance.chunk_count} chunks"
         )
+
+        # ═══════════════════════════════════════════════════════════════
+        # SEND START EVENTS - Just before UDP audio
+        # ═══════════════════════════════════════════════════════════════
+        await self._send_ws_command({
+            "type": "start_speaking",
+            "category": "SPEAKING_NEUTRAL",
+            "timestamp": time.time(),
+        })
+        logger.info("✅ start_speaking sent (just before UDP)")
+
+        await self._send_ws_command({
+            "type": "start_audio_stream",
+            "timestamp": time.time(),
+        })
+        logger.info("✅ start_audio_stream sent (just before UDP)")
 
         # Send audio in UDP packets
         packets_sent = 0
@@ -418,7 +544,22 @@ class UnrealAudioStreamer(FrameProcessor):
             f"Actual: {elapsed:.0f}ms"
         )
 
-        # NOW send the stop frame - audio is complete
+        # ═══════════════════════════════════════════════════════════════
+        # SEND STOP EVENTS - Just after UDP audio completes
+        # ═══════════════════════════════════════════════════════════════
+        await self._send_ws_command({
+            "type": "end_audio_stream",
+            "timestamp": time.time(),
+        })
+        logger.info("✅ end_audio_stream sent (after UDP complete)")
+
+        await self._send_ws_command({
+            "type": "stop_speaking",
+            "timestamp": time.time(),
+        })
+        logger.info("✅ stop_speaking sent (after UDP complete)")
+
+        # Forward the stop frame downstream
         await self.push_frame(TTSStoppedFrame(), utterance.direction)
 
     def _send_udp_packet(self, data: bytes) -> bool:

@@ -149,6 +149,7 @@ class AvatarPipeline:
         self.unreal_audio = UnrealAudioStreamer(
             host=self.settings.unreal_audio_udp_host,
             port=self.settings.unreal_audio_udp_port,
+            websocket_uri=self.settings.unreal_websocket_uri,
         )
 
         return self.unreal_events, self.unreal_audio
