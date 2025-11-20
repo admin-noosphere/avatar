@@ -25,7 +25,7 @@ from pipecat.frames.frames import (
     OutputAudioRawFrame,
     TTSStartedFrame,
     TTSStoppedFrame,
-    StartInterruptionFrame,
+    InterruptionFrame,
     CancelFrame,
 )
 from pipecat.processors.frame_processor import FrameDirection, FrameProcessor
@@ -280,38 +280,39 @@ class UnrealAudioStreamer(FrameProcessor):
                 await self.push_frame(frame, direction)
 
         # ═══════════════════════════════════════════════════════════════
-        # 4. Interruption → Cancel everything
+        # 4. Interruption → Cancel everything and stop audio
         # ═══════════════════════════════════════════════════════════════
-        elif isinstance(frame, (StartInterruptionFrame, CancelFrame)):
-            # Cancel playback
-            if self._playback_task:
-                self._playback_task.cancel()
-                try:
-                    await self._playback_task
-                except asyncio.CancelledError:
-                    pass
-                self._playback_task = None
-
+        elif isinstance(frame, (InterruptionFrame, CancelFrame)):
             # Log what we're canceling
             pending = [u for u in self._utterance_queue if not u.is_complete]
             complete = [u for u in self._utterance_queue if u.is_complete]
 
-            if pending or complete:
-                logger.info(
-                    f"🛑 Interruption | "
-                    f"Canceling {len(pending)} pending, {len(complete)} complete utterances"
-                )
+            logger.info(
+                f"🛑 INTERRUPTION | "
+                f"Canceling {len(pending)} pending + {len(complete)} complete utterances | "
+                f"Was playing: {self._is_playing}"
+            )
 
-            # Clear queue
+            # Cancel playback task (don't await - let it cancel in background)
+            if self._playback_task:
+                self._playback_task.cancel()
+                self._playback_task = None
+
+            # Clear ALL queued utterances
             self._utterance_queue = []
             self._is_playing = False
 
+            # Forward interruption to EventProcessor so it sends stop_speaking
             await self.push_frame(frame, direction)
 
         # ═══════════════════════════════════════════════════════════════
-        # 5. Other frames → Pass through
+        # 5. Other frames → Pass through (with debug for system frames)
         # ═══════════════════════════════════════════════════════════════
         else:
+            frame_name = type(frame).__name__
+            # Log system/control frames for debugging
+            if "Interrupt" in frame_name or "Cancel" in frame_name or "Stop" in frame_name:
+                logger.info(f"🔍 Frame passthrough: {frame_name}")
             await self.push_frame(frame, direction)
 
     async def _play_queue(self) -> None:

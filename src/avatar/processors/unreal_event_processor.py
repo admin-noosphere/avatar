@@ -18,7 +18,8 @@ from websockets.exceptions import ConnectionClosed, WebSocketException
 
 from pipecat.frames.frames import (
     Frame,
-    StartInterruptionFrame,
+    InterruptionFrame,
+    CancelFrame,
     TTSStartedFrame,
     TTSStoppedFrame,
 )
@@ -191,16 +192,18 @@ class UnrealEventProcessor(FrameProcessor):
                 logger.info("✅ stop_speaking sent")
 
         # Handle User Interruption (barge-in) - Immediately stop avatar
-        elif isinstance(frame, StartInterruptionFrame):
+        elif isinstance(frame, (InterruptionFrame, CancelFrame)):
+            logger.info(f"🛑 INTERRUPTION received: {type(frame).__name__}")
             await self._send_command({
                 "type": "end_audio_stream",
                 "timestamp": time.time(),
             })
-            await self._send_command({
+            sent = await self._send_command({
                 "type": "stop_speaking",
                 "timestamp": time.time(),
             })
-            logger.info("Sent stop commands (interruption)")
+            if sent:
+                logger.info("✅ stop_speaking sent (interruption)")
 
         # Forward frame downstream
         await self.push_frame(frame, direction)
