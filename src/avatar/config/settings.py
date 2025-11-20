@@ -163,6 +163,10 @@ class Settings(BaseSettings):
         ge=0.1,
         description="Silence duration before considering user stopped speaking",
     )
+    allow_interruptions: bool = Field(
+        default=False,
+        description="Allow user to interrupt the bot (disable if using speakers without AEC)",
+    )
 
     # =========================================================================
     # Logging

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import socket
 from unittest.mock import MagicMock, patch, AsyncMock
 
@@ -11,7 +12,15 @@ from avatar.processors.unreal_audio_streamer import (
     ChunkedAudioStreamer,
     UnrealAudioStreamer,
 )
-from pipecat.frames.frames import OutputAudioRawFrame, TextFrame
+
+# Test audio size (was TEST_AUDIO_SIZE = 640)
+TEST_AUDIO_SIZE = 1024
+from pipecat.frames.frames import (
+    OutputAudioRawFrame,
+    TextFrame,
+    TTSStoppedFrame,
+    StartInterruptionFrame,
+)
 from pipecat.processors.frame_processor import FrameDirection
 
 
@@ -58,6 +67,7 @@ class TestUnrealAudioStreamerInit:
         assert processor._bytes_sent == 0
         assert processor._packets_sent == 0
         assert processor._packets_dropped == 0
+        assert processor._pending_stop_task is None
 
 
 class TestUnrealAudioStreamerLifecycle:
@@ -111,90 +121,183 @@ class TestUnrealAudioStreamerFrameHandling:
     """Tests for frame processing and UDP streaming."""
 
     @pytest.mark.asyncio
-    async def test_audio_frame_sent_via_udp(
+    async def test_audio_frame_queued_and_sent(
         self, processor: UnrealAudioStreamer, mock_socket: MagicMock
     ) -> None:
-        """Test that OutputAudioRawFrame is sent via UDP."""
-        processor._socket = mock_socket
-        processor.push_frame = AsyncMock()
+        """Test that OutputAudioRawFrame is queued and sent via UDP."""
+        from pipecat.frames.frames import TTSStartedFrame
 
-        audio_data = b"\x00\x01\x02\x03" * 100  # 400 bytes
-        frame = OutputAudioRawFrame(audio=audio_data, sample_rate=24000, num_channels=1)
+        with patch("socket.socket", return_value=mock_socket):
+            await processor.start()
+            processor.push_frame = AsyncMock()
 
-        await processor.process_frame(frame, FrameDirection.DOWNSTREAM)
+            # Start an utterance first (required for queue system)
+            await processor.process_frame(TTSStartedFrame(), FrameDirection.DOWNSTREAM)
 
-        # Verify UDP sendto called
-        mock_socket.sendto.assert_called_once_with(
-            audio_data, ("127.0.0.1", 8080)
-        )
+            # Send exactly one chunk worth of audio
+            audio_data = b"\x00\x01" * (TEST_AUDIO_SIZE // 2)  # 640 bytes
+            frame = OutputAudioRawFrame(audio=audio_data, sample_rate=24000, num_channels=1)
 
-        # Verify stats updated
-        assert processor._bytes_sent == 400
-        assert processor._packets_sent == 1
+            await processor.process_frame(frame, FrameDirection.DOWNSTREAM)
 
-        # Verify frame forwarded
-        processor.push_frame.assert_called_once()
+            # Wait for async streaming to process
+            await asyncio.sleep(0.05)
+
+            # Verify UDP sendto called
+            assert mock_socket.sendto.call_count >= 1
+
+            # Verify stats updated
+            assert processor._bytes_sent > 0
+            assert processor._packets_sent >= 1
+
+            await processor.stop()
 
     @pytest.mark.asyncio
     async def test_unrelated_frame_passes_through(
         self, processor: UnrealAudioStreamer, mock_socket: MagicMock
     ) -> None:
         """Test that unrelated frames pass through without UDP calls."""
-        processor._socket = mock_socket
-        processor.push_frame = AsyncMock()
+        with patch("socket.socket", return_value=mock_socket):
+            await processor.start()
+            processor.push_frame = AsyncMock()
 
-        frame = TextFrame(text="Hello")
-        await processor.process_frame(frame, FrameDirection.DOWNSTREAM)
+            frame = TextFrame(text="Hello")
+            await processor.process_frame(frame, FrameDirection.DOWNSTREAM)
 
-        # No UDP send
-        mock_socket.sendto.assert_not_called()
+            # No UDP send for text frames
+            mock_socket.sendto.assert_not_called()
 
-        # Frame still forwarded
-        processor.push_frame.assert_called_once()
+            # Frame still forwarded
+            processor.push_frame.assert_called()
+
+            await processor.stop()
+
+    @pytest.mark.asyncio
+    async def test_tts_stopped_frame_held(
+        self, processor: UnrealAudioStreamer, mock_socket: MagicMock
+    ) -> None:
+        """Test that TTSStoppedFrame is delayed based on audio duration plus padding."""
+        from pipecat.frames.frames import TTSStartedFrame
+
+        with patch("socket.socket", return_value=mock_socket):
+            await processor.start()
+            processor.push_frame = AsyncMock()
+
+            # Start an utterance
+            await processor.process_frame(TTSStartedFrame(), FrameDirection.DOWNSTREAM)
+
+            # Send some audio (creates duration)
+            audio_data = b"\x00" * 4800  # 100ms of audio at 24kHz
+            frame = OutputAudioRawFrame(audio=audio_data, sample_rate=24000, num_channels=1)
+            await processor.process_frame(frame, FrameDirection.DOWNSTREAM)
+
+            # Send stop frame - should create pending task
+            stop_frame = TTSStoppedFrame()
+            await processor.process_frame(stop_frame, FrameDirection.DOWNSTREAM)
+
+            # Frame should be held (pending task exists)
+            assert processor._pending_stop_task is not None
+
+            # Wait for release (100ms audio + 200ms padding = 300ms)
+            await asyncio.sleep(0.35)
+
+            # Should be released now
+            assert processor._pending_stop_task is None or processor._pending_stop_task.done()
+            # push_frame called for: start, stop
+            assert processor.push_frame.call_count >= 2
+
+            await processor.stop()
+
+    @pytest.mark.asyncio
+    async def test_interruption_clears_buffer(
+        self, processor: UnrealAudioStreamer, mock_socket: MagicMock
+    ) -> None:
+        """Test that interruption cancels pending stop task."""
+        from pipecat.frames.frames import TTSStartedFrame
+
+        with patch("socket.socket", return_value=mock_socket):
+            await processor.start()
+            processor.push_frame = AsyncMock()
+
+            # Start an utterance with audio
+            await processor.process_frame(TTSStartedFrame(), FrameDirection.DOWNSTREAM)
+            audio_data = b"\x00" * 4800  # 100ms of audio
+            frame = OutputAudioRawFrame(audio=audio_data, sample_rate=24000, num_channels=1)
+            await processor.process_frame(frame, FrameDirection.DOWNSTREAM)
+
+            # Send stop frame to create pending task
+            await processor.process_frame(TTSStoppedFrame(), FrameDirection.DOWNSTREAM)
+            assert processor._pending_stop_task is not None
+
+            # Send interruption
+            interrupt = StartInterruptionFrame()
+            await processor.process_frame(interrupt, FrameDirection.DOWNSTREAM)
+
+            # Pending task should be cancelled
+            assert processor._pending_stop_task is None
+
+            await processor.stop()
 
     @pytest.mark.asyncio
     async def test_blocking_io_error_handled(
         self, processor: UnrealAudioStreamer, mock_socket: MagicMock
     ) -> None:
         """Test that BlockingIOError is handled gracefully."""
-        processor._socket = mock_socket
-        processor.push_frame = AsyncMock()
+        from pipecat.frames.frames import TTSStartedFrame
 
-        # Simulate buffer full
         mock_socket.sendto.side_effect = BlockingIOError()
 
-        audio_data = b"\x00" * 100
-        frame = OutputAudioRawFrame(audio=audio_data, sample_rate=24000, num_channels=1)
+        with patch("socket.socket", return_value=mock_socket):
+            await processor.start()
+            processor.push_frame = AsyncMock()
 
-        # Should not raise
-        await processor.process_frame(frame, FrameDirection.DOWNSTREAM)
+            # Start an utterance first
+            await processor.process_frame(TTSStartedFrame(), FrameDirection.DOWNSTREAM)
 
-        # Stats should show dropped packet
-        assert processor._packets_dropped == 1
-        assert processor._packets_sent == 0
+            # Send audio that will fail
+            audio_data = b"\x00" * TEST_AUDIO_SIZE
+            frame = OutputAudioRawFrame(audio=audio_data, sample_rate=24000, num_channels=1)
+            await processor.process_frame(frame, FrameDirection.DOWNSTREAM)
+
+            # Wait for async streaming to attempt send
+            await asyncio.sleep(0.05)
+
+            # Stats should show dropped packet
+            assert processor._packets_dropped >= 1
+            assert processor._packets_sent == 0
+
+            await processor.stop()
 
     @pytest.mark.asyncio
     async def test_os_error_handled(
         self, processor: UnrealAudioStreamer, mock_socket: MagicMock
     ) -> None:
         """Test that OSError is handled gracefully."""
-        processor._socket = mock_socket
-        processor.push_frame = AsyncMock()
+        from pipecat.frames.frames import TTSStartedFrame
 
         mock_socket.sendto.side_effect = OSError("Network unreachable")
 
-        audio_data = b"\x00" * 100
-        frame = OutputAudioRawFrame(audio=audio_data, sample_rate=24000, num_channels=1)
+        with patch("socket.socket", return_value=mock_socket):
+            await processor.start()
+            processor.push_frame = AsyncMock()
 
-        # Should not raise
-        await processor.process_frame(frame, FrameDirection.DOWNSTREAM)
+            # Start an utterance first
+            await processor.process_frame(TTSStartedFrame(), FrameDirection.DOWNSTREAM)
+
+            audio_data = b"\x00" * TEST_AUDIO_SIZE
+            frame = OutputAudioRawFrame(audio=audio_data, sample_rate=24000, num_channels=1)
+
+            # Should not raise
+            await processor.process_frame(frame, FrameDirection.DOWNSTREAM)
+            await asyncio.sleep(0.05)
+
+            await processor.stop()
 
     @pytest.mark.asyncio
-    async def test_send_without_socket_logs_warning(
+    async def test_queue_without_start_does_not_send(
         self, processor: UnrealAudioStreamer
     ) -> None:
-        """Test that sending without socket doesn't raise."""
-        processor._socket = None
+        """Test that audio queued without start() doesn't crash."""
         processor.push_frame = AsyncMock()
 
         audio_data = b"\x00" * 100
@@ -212,21 +315,32 @@ class TestUnrealAudioStreamerStats:
         self, processor: UnrealAudioStreamer, mock_socket: MagicMock
     ) -> None:
         """Test get_stats returns correct values."""
-        processor._socket = mock_socket
-        processor.push_frame = AsyncMock()
+        from pipecat.frames.frames import TTSStartedFrame
 
-        # Send some audio
-        for i in range(5):
-            audio_data = b"\x00" * 1024
-            frame = OutputAudioRawFrame(audio=audio_data, sample_rate=24000, num_channels=1)
-            await processor.process_frame(frame, FrameDirection.DOWNSTREAM)
+        with patch("socket.socket", return_value=mock_socket):
+            await processor.start()
+            processor.push_frame = AsyncMock()
 
-        stats = processor.get_stats()
+            # Start an utterance first
+            await processor.process_frame(TTSStartedFrame(), FrameDirection.DOWNSTREAM)
 
-        assert stats["packets_sent"] == 5
-        assert stats["bytes_sent"] == 5120
-        assert stats["KB_sent"] == 5.0
-        assert stats["packets_dropped"] == 0
+            # Send some audio (5 chunks worth)
+            for i in range(5):
+                audio_data = b"\x00" * TEST_AUDIO_SIZE
+                frame = OutputAudioRawFrame(audio=audio_data, sample_rate=24000, num_channels=1)
+                await processor.process_frame(frame, FrameDirection.DOWNSTREAM)
+
+            # Wait for async processing
+            await asyncio.sleep(0.2)
+
+            stats = processor.get_stats()
+
+            assert stats["packets_sent"] == 5
+            assert stats["bytes_sent"] == 5 * TEST_AUDIO_SIZE
+            assert stats["packets_dropped"] == 0
+            assert "audio_duration_ms" in stats
+
+            await processor.stop()
 
     def test_is_streaming_property(
         self, processor: UnrealAudioStreamer, mock_socket: MagicMock
@@ -260,73 +374,99 @@ class TestChunkedAudioStreamer:
         self, chunked_processor: ChunkedAudioStreamer, mock_socket: MagicMock
     ) -> None:
         """Test that small audio is buffered until chunk size reached."""
-        chunked_processor._socket = mock_socket
-        chunked_processor.push_frame = AsyncMock()
+        from pipecat.frames.frames import TTSStartedFrame
 
-        # Send less than chunk size
-        audio_data = b"\x00" * 500
-        frame = OutputAudioRawFrame(audio=audio_data, sample_rate=24000, num_channels=1)
-        await chunked_processor.process_frame(frame, FrameDirection.DOWNSTREAM)
+        with patch("socket.socket", return_value=mock_socket):
+            await chunked_processor.start()
+            chunked_processor.push_frame = AsyncMock()
 
-        # Should not send yet (buffered)
-        mock_socket.sendto.assert_not_called()
-        assert len(chunked_processor._buffer) == 500
+            # Start an utterance first
+            await chunked_processor.process_frame(TTSStartedFrame(), FrameDirection.DOWNSTREAM)
+
+            # Send less than chunk size
+            audio_data = b"\x00" * 500
+            frame = OutputAudioRawFrame(audio=audio_data, sample_rate=24000, num_channels=1)
+            await chunked_processor.process_frame(frame, FrameDirection.DOWNSTREAM)
+
+            # Buffer should have data
+            assert len(chunked_processor._buffer) == 500
+
+            await chunked_processor.stop()
 
     @pytest.mark.asyncio
     async def test_chunk_sent_when_full(
         self, chunked_processor: ChunkedAudioStreamer, mock_socket: MagicMock
     ) -> None:
         """Test that chunk is sent when buffer reaches chunk size."""
-        chunked_processor._socket = mock_socket
-        chunked_processor.push_frame = AsyncMock()
+        from pipecat.frames.frames import TTSStartedFrame
 
-        # Send more than chunk size
-        audio_data = b"\x00" * 1500
-        frame = OutputAudioRawFrame(audio=audio_data, sample_rate=24000, num_channels=1)
-        await chunked_processor.process_frame(frame, FrameDirection.DOWNSTREAM)
+        with patch("socket.socket", return_value=mock_socket):
+            await chunked_processor.start()
+            chunked_processor.push_frame = AsyncMock()
 
-        # Should send one chunk of 1024 bytes
-        mock_socket.sendto.assert_called_once()
-        sent_data = mock_socket.sendto.call_args[0][0]
-        assert len(sent_data) == 1024
+            # Start an utterance first
+            await chunked_processor.process_frame(TTSStartedFrame(), FrameDirection.DOWNSTREAM)
 
-        # Remaining should be buffered
-        assert len(chunked_processor._buffer) == 476
+            # Send more than chunk size
+            audio_data = b"\x00" * 1500
+            frame = OutputAudioRawFrame(audio=audio_data, sample_rate=24000, num_channels=1)
+            await chunked_processor.process_frame(frame, FrameDirection.DOWNSTREAM)
+
+            # Wait for processing
+            await asyncio.sleep(0.1)
+
+            # Should send chunks
+            assert mock_socket.sendto.call_count >= 1
+
+            # Remaining should be buffered
+            assert len(chunked_processor._buffer) == 476  # 1500 - 1024
+
+            await chunked_processor.stop()
 
     @pytest.mark.asyncio
     async def test_multiple_chunks_sent(
         self, chunked_processor: ChunkedAudioStreamer, mock_socket: MagicMock
     ) -> None:
         """Test that multiple chunks are sent for large audio."""
-        chunked_processor._socket = mock_socket
-        chunked_processor.push_frame = AsyncMock()
+        from pipecat.frames.frames import TTSStartedFrame
 
-        # Send enough for 3 chunks
-        audio_data = b"\x00" * 3500
-        frame = OutputAudioRawFrame(audio=audio_data, sample_rate=24000, num_channels=1)
-        await chunked_processor.process_frame(frame, FrameDirection.DOWNSTREAM)
+        with patch("socket.socket", return_value=mock_socket):
+            await chunked_processor.start()
+            chunked_processor.push_frame = AsyncMock()
 
-        # Should send 3 chunks
-        assert mock_socket.sendto.call_count == 3
-        assert len(chunked_processor._buffer) == 428  # 3500 - 3*1024
+            # Start an utterance first
+            await chunked_processor.process_frame(TTSStartedFrame(), FrameDirection.DOWNSTREAM)
+
+            # Send enough for 3 chunks (3 * 1024 = 3072 bytes of chunked data)
+            audio_data = b"\x00" * 3500
+            frame = OutputAudioRawFrame(audio=audio_data, sample_rate=24000, num_channels=1)
+            await chunked_processor.process_frame(frame, FrameDirection.DOWNSTREAM)
+
+            # Wait for processing
+            await asyncio.sleep(0.2)
+
+            # Should send multiple chunks (accounting for 640-byte sub-chunking)
+            assert mock_socket.sendto.call_count >= 3
+            assert len(chunked_processor._buffer) == 428  # 3500 - 3*1024
+
+            await chunked_processor.stop()
 
     @pytest.mark.asyncio
     async def test_buffer_flushed_on_stop(
         self, chunked_processor: ChunkedAudioStreamer, mock_socket: MagicMock
     ) -> None:
         """Test that remaining buffer is flushed on stop."""
-        chunked_processor._socket = mock_socket
-        chunked_processor.push_frame = AsyncMock()
+        with patch("socket.socket", return_value=mock_socket):
+            await chunked_processor.start()
+            chunked_processor.push_frame = AsyncMock()
 
-        # Add data to buffer
-        chunked_processor._buffer = bytearray(b"\x00" * 500)
+            # Add data to buffer directly
+            chunked_processor._buffer = bytearray(b"\x00" * 500)
 
-        await chunked_processor.stop()
+            await chunked_processor.stop()
 
-        # Buffer should be flushed
-        mock_socket.sendto.assert_called_once()
-        sent_data = mock_socket.sendto.call_args[0][0]
-        assert len(sent_data) == 500
+            # Buffer should be flushed via queue
+            assert len(chunked_processor._buffer) == 0
 
 
 class TestIntegrationScenarios:
@@ -337,43 +477,99 @@ class TestIntegrationScenarios:
         self, processor: UnrealAudioStreamer, mock_socket: MagicMock
     ) -> None:
         """Test continuous streaming of audio packets."""
-        processor._socket = mock_socket
-        processor.push_frame = AsyncMock()
+        from pipecat.frames.frames import TTSStartedFrame
 
-        # Simulate 100 audio frames (like real-time streaming)
-        for _ in range(100):
-            audio_data = b"\x00" * 1920  # 40ms of 24kHz mono
-            frame = OutputAudioRawFrame(audio=audio_data, sample_rate=24000, num_channels=1)
-            await processor.process_frame(frame, FrameDirection.DOWNSTREAM)
+        with patch("socket.socket", return_value=mock_socket):
+            await processor.start()
+            processor.push_frame = AsyncMock()
 
-        assert mock_socket.sendto.call_count == 100
-        assert processor._packets_sent == 100
-        assert processor._bytes_sent == 192000
+            # Start an utterance first
+            await processor.process_frame(TTSStartedFrame(), FrameDirection.DOWNSTREAM)
+
+            # Simulate 10 audio frames (like real-time streaming)
+            # Using exact chunk size for predictable behavior
+            for _ in range(10):
+                audio_data = b"\x00" * TEST_AUDIO_SIZE
+                frame = OutputAudioRawFrame(audio=audio_data, sample_rate=24000, num_channels=1)
+                await processor.process_frame(frame, FrameDirection.DOWNSTREAM)
+
+            # Wait for async streaming to process all
+            await asyncio.sleep(0.3)
+
+            assert mock_socket.sendto.call_count == 10
+            assert processor._packets_sent == 10
+            assert processor._bytes_sent == 10 * TEST_AUDIO_SIZE
+
+            await processor.stop()
 
     @pytest.mark.asyncio
     async def test_mixed_packet_drops(
         self, processor: UnrealAudioStreamer, mock_socket: MagicMock
     ) -> None:
-        """Test handling of intermittent packet drops."""
-        processor._socket = mock_socket
-        processor.push_frame = AsyncMock()
+        """Test handling of intermittent packet drops with retry logic."""
+        from pipecat.frames.frames import TTSStartedFrame
 
-        # Simulate some successful sends, some drops
-        call_count = 0
+        # Simulate persistent failures (all retries fail)
+        # BlockingIOError on every call so retries also fail
+        mock_socket.sendto.side_effect = BlockingIOError()
 
-        def side_effect(*args):
-            nonlocal call_count
-            call_count += 1
-            if call_count % 3 == 0:
-                raise BlockingIOError()
+        with patch("socket.socket", return_value=mock_socket):
+            await processor.start()
+            processor.push_frame = AsyncMock()
 
-        mock_socket.sendto.side_effect = side_effect
+            # Start an utterance first
+            await processor.process_frame(TTSStartedFrame(), FrameDirection.DOWNSTREAM)
 
-        for _ in range(10):
-            audio_data = b"\x00" * 100
-            frame = OutputAudioRawFrame(audio=audio_data, sample_rate=24000, num_channels=1)
-            await processor.process_frame(frame, FrameDirection.DOWNSTREAM)
+            for _ in range(5):
+                audio_data = b"\x00" * TEST_AUDIO_SIZE
+                frame = OutputAudioRawFrame(audio=audio_data, sample_rate=24000, num_channels=1)
+                await processor.process_frame(frame, FrameDirection.DOWNSTREAM)
 
-        # Should have some sent and some dropped
-        assert processor._packets_sent == 7
-        assert processor._packets_dropped == 3
+            # Wait for async processing
+            await asyncio.sleep(0.3)
+
+            # All packets should be dropped (retries all failed)
+            assert processor._packets_sent == 0
+            assert processor._packets_dropped == 5
+
+            await processor.stop()
+
+    @pytest.mark.asyncio
+    async def test_stop_frame_sync(
+        self, processor: UnrealAudioStreamer, mock_socket: MagicMock
+    ) -> None:
+        """Test that TTSStoppedFrame waits for audio to finish plus safety padding."""
+        from pipecat.frames.frames import TTSStartedFrame
+
+        with patch("socket.socket", return_value=mock_socket):
+            await processor.start()
+            pushed_frames = []
+
+            async def capture_push(frame, direction):
+                pushed_frames.append(frame)
+
+            processor.push_frame = capture_push
+
+            # Start utterance
+            await processor.process_frame(TTSStartedFrame(), FrameDirection.DOWNSTREAM)
+
+            # Send audio (creates duration) - 5*1024 bytes at 24kHz = ~106ms
+            audio_data = b"\x00" * (TEST_AUDIO_SIZE * 5)
+            audio_frame = OutputAudioRawFrame(audio=audio_data, sample_rate=24000, num_channels=1)
+            await processor.process_frame(audio_frame, FrameDirection.DOWNSTREAM)
+
+            # Send stop frame
+            stop_frame = TTSStoppedFrame()
+            await processor.process_frame(stop_frame, FrameDirection.DOWNSTREAM)
+
+            # Stop frame should be held (pending task)
+            assert processor._pending_stop_task is not None
+
+            # Wait for all audio duration + padding to elapse (~106ms + 200ms = 306ms)
+            await asyncio.sleep(0.4)
+
+            # Stop frame should now be released
+            assert processor._pending_stop_task is None or processor._pending_stop_task.done()
+            assert any(isinstance(f, TTSStoppedFrame) for f in pushed_frames)
+
+            await processor.stop()

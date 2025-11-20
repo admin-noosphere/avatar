@@ -112,11 +112,16 @@ class TestUnrealEventProcessorFrameHandling:
         frame = TTSStartedFrame()
         await processor.process_frame(frame, FrameDirection.DOWNSTREAM)
 
-        # Verify WebSocket message
-        mock_websocket.send.assert_called_once()
-        sent_data = json.loads(mock_websocket.send.call_args[0][0])
-        assert sent_data["type"] == "start_speaking"
-        assert sent_data["category"] == "SPEAKING_NEUTRAL"
+        # Verify WebSocket messages (2 calls: start_speaking + start_audio_stream)
+        assert mock_websocket.send.call_count == 2
+        calls = mock_websocket.send.call_args_list
+
+        start_msg = json.loads(calls[0][0][0])
+        assert start_msg["type"] == "start_speaking"
+        assert start_msg["category"] == "SPEAKING_NEUTRAL"
+
+        stream_msg = json.loads(calls[1][0][0])
+        assert stream_msg["type"] == "start_audio_stream"
 
         # Verify frame was forwarded
         processor.push_frame.assert_called_once_with(
@@ -134,10 +139,15 @@ class TestUnrealEventProcessorFrameHandling:
         frame = TTSStoppedFrame()
         await processor.process_frame(frame, FrameDirection.DOWNSTREAM)
 
-        # Verify WebSocket message
-        mock_websocket.send.assert_called_once()
-        sent_data = json.loads(mock_websocket.send.call_args[0][0])
-        assert sent_data["type"] == "stop_speaking"
+        # Verify WebSocket messages (2 calls: end_audio_stream + stop_speaking)
+        assert mock_websocket.send.call_count == 2
+        calls = mock_websocket.send.call_args_list
+
+        stream_end_msg = json.loads(calls[0][0][0])
+        assert stream_end_msg["type"] == "end_audio_stream"
+
+        stop_msg = json.loads(calls[1][0][0])
+        assert stop_msg["type"] == "stop_speaking"
 
     @pytest.mark.asyncio
     async def test_interruption_sends_stop_speaking(

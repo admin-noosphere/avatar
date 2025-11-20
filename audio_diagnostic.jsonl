@@ -1,0 +1,24 @@
+{"timestamp": 0.3380639827810228, "event_type": "UTTERANCE_STARTED", "utterance_id": 1, "data": {}}
+{"timestamp": 240.80533301457763, "event_type": "AUDIO_RECEIVED", "utterance_id": 1, "data": {"bytes": 49008, "duration_ms": 1020.9999999999999, "total_bytes": 49008, "total_duration_ms": 1020.9999999999999}}
+{"timestamp": 241.48524698102847, "event_type": "AUDIO_SENT", "utterance_id": 1, "data": {"bytes": 49008}}
+{"timestamp": 2242.4307700130157, "event_type": "STOP_RECEIVED", "utterance_id": 1, "data": {"elapsed_ms": 2242.097419046331, "audio_duration_ms": 1020.9999999999999, "remaining_ms": 0, "total_bytes": 49008, "total_chunks": 1}}
+{"timestamp": 2242.821401974652, "event_type": "UTTERANCE_COMPLETED", "utterance_id": 1, "data": {"total_time_ms": 2242.4880510079674, "audio_duration_ms": 1020.9999999999999, "total_bytes": 49008, "total_chunks": 1}}
+{"timestamp": 3240.1945239980705, "event_type": "AUDIO_RECEIVED", "utterance_id": 1, "data": {"bytes": 24000, "duration_ms": 500.0, "total_bytes": 73008, "total_duration_ms": 1521.0}}
+{"timestamp": 3240.741738991346, "event_type": "AUDIO_SENT", "utterance_id": 1, "data": {"bytes": 24000}}
+{"timestamp": 9567.157856014092, "event_type": "UTTERANCE_STARTED", "utterance_id": 2, "data": {}}
+{"timestamp": 9788.644763000775, "event_type": "AUDIO_RECEIVED", "utterance_id": 2, "data": {"bytes": 60154, "duration_ms": 1253.2083333333333, "total_bytes": 60154, "total_duration_ms": 1253.2083333333333}}
+{"timestamp": 9789.288787986152, "event_type": "AUDIO_SENT", "utterance_id": 2, "data": {"bytes": 60154}}
+{"timestamp": 15198.21216899436, "event_type": "UTTERANCE_STARTED", "utterance_id": 3, "data": {}}
+{"timestamp": 15404.992673022207, "event_type": "AUDIO_RECEIVED", "utterance_id": 2, "data": {"bytes": 35634, "duration_ms": 742.375, "total_bytes": 95788, "total_duration_ms": 1995.5833333333333}}
+{"timestamp": 15405.52841097815, "event_type": "AUDIO_SENT", "utterance_id": 2, "data": {"bytes": 35634}}
+{"timestamp": 15519.152053981088, "event_type": "AUDIO_RECEIVED", "utterance_id": 2, "data": {"bytes": 60154, "duration_ms": 1253.2083333333333, "total_bytes": 155942, "total_duration_ms": 3248.7916666666665}}
+{"timestamp": 15519.36888199998, "event_type": "AUDIO_SENT", "utterance_id": 2, "data": {"bytes": 60154}}
+{"timestamp": 17544.11227599485, "event_type": "UTTERANCE_STARTED", "utterance_id": 4, "data": {}}
+{"timestamp": 25719.002072000876, "event_type": "UTTERANCE_STARTED", "utterance_id": 5, "data": {}}
+{"timestamp": 25961.811386980116, "event_type": "AUDIO_RECEIVED", "utterance_id": 2, "data": {"bytes": 49008, "duration_ms": 1020.9999999999999, "total_bytes": 204950, "total_duration_ms": 4269.791666666666}}
+{"timestamp": 25962.340077967383, "event_type": "AUDIO_SENT", "utterance_id": 2, "data": {"bytes": 49008}}
+{"timestamp": 27962.374556984287, "event_type": "STOP_RECEIVED", "utterance_id": 2, "data": {"elapsed_ms": 18395.22168401163, "audio_duration_ms": 4269.791666666666, "remaining_ms": 0, "total_bytes": 204950, "total_chunks": 4}}
+{"timestamp": 27962.765316013247, "event_type": "UTTERANCE_COMPLETED", "utterance_id": 2, "data": {"total_time_ms": 18395.61244304059, "audio_duration_ms": 4269.791666666666, "total_bytes": 204950, "total_chunks": 4}}
+{"timestamp": 28961.71731199138, "event_type": "AUDIO_RECEIVED", "utterance_id": 3, "data": {"bytes": 24000, "duration_ms": 500.0, "total_bytes": 24000, "total_duration_ms": 500.0}}
+{"timestamp": 28962.34132500831, "event_type": "AUDIO_SENT", "utterance_id": 3, "data": {"bytes": 24000}}
+{"timestamp": 34985.57063401677, "event_type": "INTERRUPTION", "utterance_id": 3, "data": {}}

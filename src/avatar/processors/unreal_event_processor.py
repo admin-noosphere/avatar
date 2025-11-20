@@ -65,6 +65,9 @@ class UnrealEventProcessor(FrameProcessor):
         self._running = False
         self._current_delay = reconnect_delay
 
+        # Queue for commands when WebSocket not connected
+        self._command_queue: list[dict[str, Any]] = []
+
     async def start(self) -> None:
         """Start the processor and initiate WebSocket connection."""
         self._running = True
@@ -101,6 +104,13 @@ class UnrealEventProcessor(FrameProcessor):
                     self._websocket = ws
                     self._current_delay = self.reconnect_delay  # Reset backoff
                     logger.info(f"✅ Connected to Unreal Engine at {self.uri}")
+
+                    # Send any queued commands
+                    if self._command_queue:
+                        logger.info(f"📤 Sending {len(self._command_queue)} queued commands...")
+                        for cmd in self._command_queue:
+                            await self._send_command(cmd)
+                        self._command_queue.clear()
 
                     # Wait until connection closes
                     await ws.wait_closed()
@@ -144,35 +154,41 @@ class UnrealEventProcessor(FrameProcessor):
         # Handle TTS Started - Avatar starts speaking
         if isinstance(frame, TTSStartedFrame):
             # Send start_speaking with category and timestamp
-            await self._send_command({
+            sent = await self._send_command({
                 "type": "start_speaking",
                 "category": "SPEAKING_NEUTRAL",
                 "timestamp": time.time(),
             })
-            logger.info("Sent start_speaking command")
+            if sent:
+                logger.info("✅ start_speaking sent")
+            else:
+                logger.info("⏳ start_speaking queued (will send when connected)")
 
             # Send start_audio_stream
-            await self._send_command({
+            sent = await self._send_command({
                 "type": "start_audio_stream",
                 "timestamp": time.time(),
             })
-            logger.info("Sent start_audio_stream command")
+            if sent:
+                logger.info("✅ start_audio_stream sent")
 
         # Handle TTS Stopped - Avatar stops speaking
         elif isinstance(frame, TTSStoppedFrame):
             # Send end_audio_stream
-            await self._send_command({
+            sent = await self._send_command({
                 "type": "end_audio_stream",
                 "timestamp": time.time(),
             })
-            logger.info("Sent end_audio_stream command")
+            if sent:
+                logger.info("✅ end_audio_stream sent")
 
             # Send stop_speaking
-            await self._send_command({
+            sent = await self._send_command({
                 "type": "stop_speaking",
                 "timestamp": time.time(),
             })
-            logger.info("Sent stop_speaking command")
+            if sent:
+                logger.info("✅ stop_speaking sent")
 
         # Handle User Interruption (barge-in) - Immediately stop avatar
         elif isinstance(frame, StartInterruptionFrame):
@@ -189,25 +205,38 @@ class UnrealEventProcessor(FrameProcessor):
         # Forward frame downstream
         await self.push_frame(frame, direction)
 
-    async def _send_command(self, data: dict[str, Any]) -> None:
+    async def _send_command(self, data: dict[str, Any], queue_if_disconnected: bool = True) -> bool:
         """Send a JSON command to Unreal Engine via WebSocket.
 
         Args:
             data: Dictionary to serialize and send as JSON.
+            queue_if_disconnected: If True, queue command when not connected.
+
+        Returns:
+            True if sent successfully, False otherwise.
         """
         if not self._websocket:
-            logger.warning(f"Cannot send command: WebSocket not connected (trying to send: {data.get('type')})")
-            return
+            if queue_if_disconnected:
+                self._command_queue.append(data)
+                logger.warning(f"⏳ WebSocket not connected, queued command: {data.get('type')}")
+            else:
+                logger.warning(f"Cannot send command: WebSocket not connected (trying to send: {data.get('type')})")
+            return False
 
         try:
             message = json.dumps(data)
             await self._websocket.send(message)
             logger.info(f"✅ Sent to Unreal: {message}")
+            return True
         except ConnectionClosed:
             logger.warning("Cannot send: connection closed")
             self._websocket = None
+            if queue_if_disconnected:
+                self._command_queue.append(data)
+            return False
         except WebSocketException as e:
             logger.error(f"Failed to send command: {e}")
+            return False
 
     async def send_contextual_animation(
         self,

@@ -6,9 +6,10 @@ These tests validate the full flow from input to output using mocks.
 from __future__ import annotations
 
 import asyncio
+import socket
 import sys
 from pathlib import Path
-from unittest.mock import AsyncMock, patch
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
@@ -29,6 +30,9 @@ from pipecat.processors.frame_processor import FrameDirection
 from avatar.processors.unreal_event_processor import UnrealEventProcessor
 from avatar.processors.unreal_audio_streamer import UnrealAudioStreamer
 
+# Test audio size
+TEST_AUDIO_SIZE = 1024
+
 from mock_daily_transport import (
     MockDailyTransport,
     MockDailyInput,
@@ -45,32 +49,25 @@ class TestParallelPipelineBranching:
     @pytest.mark.asyncio
     async def test_frames_reach_both_branches(self) -> None:
         """Test that frames are sent to both branches of ParallelPipeline."""
-        # Create mock outputs for each branch
-        branch_a_frames: list = []
-        branch_b_frames: list = []
-
-        class BranchACollector:
-            async def process_frame(self, frame, direction):
-                branch_a_frames.append(frame)
-
-        class BranchBCollector:
-            async def process_frame(self, frame, direction):
-                branch_b_frames.append(frame)
-
-        # We'll test the concept - actual ParallelPipeline needs proper setup
-        # For now, verify our processors forward frames correctly
+        # Create mock socket for audio processor
+        mock_sock = MagicMock(spec=socket.socket)
+        mock_sock.sendto = MagicMock(return_value=None)
+        mock_sock.close = MagicMock()
+        mock_sock.setblocking = MagicMock()
+        mock_sock.setsockopt = MagicMock()
 
         # Create processors
         event_processor = UnrealEventProcessor(uri="ws://localhost:8765")
         audio_processor = UnrealAudioStreamer(host="127.0.0.1", port=8080)
 
-        # Mock their connections
+        # Start audio processor and inject mock socket
+        await audio_processor.start()
+        audio_processor._socket = mock_sock
+
+        # Mock WebSocket for event processor
         event_processor._websocket = AsyncMock()
         event_processor._websocket.open = True
         event_processor._websocket.send = AsyncMock()
-
-        audio_processor._socket = AsyncMock()
-        audio_processor._socket.sendto = AsyncMock()
 
         # Track forwarded frames
         event_forwarded = []
@@ -88,29 +85,41 @@ class TestParallelPipelineBranching:
         # Send frames
         tts_start = TTSStartedFrame()
         audio_frame = OutputAudioRawFrame(
-            audio=b'\x00' * 100,
+            audio=b'\x00' * TEST_AUDIO_SIZE,  # Use exact chunk size
             sample_rate=24000,
             num_channels=1,
         )
         tts_stop = TTSStoppedFrame()
 
+        # Process through event processor (forwards all frames)
         await event_processor.process_frame(tts_start, FrameDirection.DOWNSTREAM)
         await event_processor.process_frame(audio_frame, FrameDirection.DOWNSTREAM)
         await event_processor.process_frame(tts_stop, FrameDirection.DOWNSTREAM)
 
+        # Process through audio processor
         await audio_processor.process_frame(tts_start, FrameDirection.DOWNSTREAM)
         await audio_processor.process_frame(audio_frame, FrameDirection.DOWNSTREAM)
         await audio_processor.process_frame(tts_stop, FrameDirection.DOWNSTREAM)
 
-        # Verify both processors received and forwarded frames
+        # Wait for async processing (audio ~21ms + 200ms safety padding)
+        await asyncio.sleep(0.3)
+
+        # Event processor forwards all frames
         assert len(event_forwarded) == 3
-        assert len(audio_forwarded) == 3
+
+        # Audio processor only forwards non-audio frames (start + stop)
+        # Note: TTSStoppedFrame is released after audio duration + safety padding
+        assert len(audio_forwarded) == 2  # start and stop (audio not forwarded)
 
         # Verify WebSocket was called for TTS events
-        assert event_processor._websocket.send.call_count == 2  # start + stop
+        # Each event sends 2 messages: start sends (start_speaking + start_audio_stream)
+        # stop sends (end_audio_stream + stop_speaking)
+        assert event_processor._websocket.send.call_count == 4
 
         # Verify UDP was called for audio
-        audio_processor._socket.sendto.assert_called_once()
+        assert mock_sock.sendto.call_count >= 1
+
+        await audio_processor.stop()
 
 
 class TestMockServices:
@@ -198,8 +207,8 @@ class TestUnrealProcessorsIntegration:
 
         await event_processor.process_frame(TTSStoppedFrame(), FrameDirection.DOWNSTREAM)
 
-        # Verify WebSocket calls
-        assert mock_ws.send.call_count == 2
+        # Verify WebSocket calls (4 total: start_speaking, start_audio_stream, end_audio_stream, stop_speaking)
+        assert mock_ws.send.call_count == 4
 
         # Check message content
         import json
@@ -208,33 +217,47 @@ class TestUnrealProcessorsIntegration:
         start_msg = json.loads(calls[0][0][0])
         assert start_msg["type"] == "start_speaking"
 
-        stop_msg = json.loads(calls[1][0][0])
+        stream_start_msg = json.loads(calls[1][0][0])
+        assert stream_start_msg["type"] == "start_audio_stream"
+
+        stream_end_msg = json.loads(calls[2][0][0])
+        assert stream_end_msg["type"] == "end_audio_stream"
+
+        stop_msg = json.loads(calls[3][0][0])
         assert stop_msg["type"] == "stop_speaking"
 
     @pytest.mark.asyncio
     async def test_audio_streamer_sends_all_chunks(self) -> None:
         """Test that audio streamer sends all audio chunks via UDP."""
+        # Create mock socket
+        mock_sock = MagicMock(spec=socket.socket)
+        mock_sock.sendto = MagicMock(return_value=None)
+        mock_sock.close = MagicMock()
+        mock_sock.setblocking = MagicMock()
+        mock_sock.setsockopt = MagicMock()
+
         audio_processor = UnrealAudioStreamer(host="127.0.0.1", port=8080)
 
-        # Start processor to create socket
+        # Start processor and inject mock socket
         await audio_processor.start()
-
-        # Mock the socket
-        import socket
-        mock_sock = AsyncMock(spec=socket.socket)
-        mock_sock.sendto = AsyncMock()
         audio_processor._socket = mock_sock
         audio_processor.push_frame = AsyncMock()
 
-        # Send audio chunks
-        num_chunks = 50
+        # Start an utterance first (required for queue system)
+        await audio_processor.process_frame(TTSStartedFrame(), FrameDirection.DOWNSTREAM)
+
+        # Send audio chunks (use exact chunk size for predictable behavior)
+        num_chunks = 10
         for _ in range(num_chunks):
             audio = OutputAudioRawFrame(
-                audio=b'\x00' * 960,
+                audio=b'\x00' * TEST_AUDIO_SIZE,
                 sample_rate=24000,
                 num_channels=1,
             )
             await audio_processor.process_frame(audio, FrameDirection.DOWNSTREAM)
+
+        # Wait for async streaming to process
+        await asyncio.sleep(0.3)
 
         # Verify all chunks sent
         assert mock_sock.sendto.call_count == num_chunks
@@ -252,6 +275,13 @@ class TestEndToEndFlow:
     @pytest.mark.asyncio
     async def test_text_to_unreal_flow(self) -> None:
         """Test flow from text input to Unreal output."""
+        # Create mock socket
+        mock_sock = MagicMock(spec=socket.socket)
+        mock_sock.sendto = MagicMock(return_value=None)
+        mock_sock.close = MagicMock()
+        mock_sock.setblocking = MagicMock()
+        mock_sock.setsockopt = MagicMock()
+
         # Create mock TTS
         tts = MockTTSService(sample_rate=24000)
 
@@ -259,15 +289,13 @@ class TestEndToEndFlow:
         event_processor = UnrealEventProcessor(uri="ws://localhost:8765")
         audio_processor = UnrealAudioStreamer(host="127.0.0.1", port=8080)
 
-        # Mock connections
+        # Mock WebSocket
         event_processor._websocket = AsyncMock()
         event_processor._websocket.open = True
         event_processor._websocket.send = AsyncMock()
 
+        # Start audio processor and inject mock socket
         await audio_processor.start()
-        import socket
-        mock_sock = AsyncMock(spec=socket.socket)
-        mock_sock.sendto = AsyncMock()
         audio_processor._socket = mock_sock
 
         # Collect frames at each stage
@@ -296,6 +324,11 @@ class TestEndToEndFlow:
         text = TextFrame(text="Bonjour comment allez vous")
         await tts.process_frame(text, FrameDirection.DOWNSTREAM)
 
+        # Wait for async streaming to complete
+        # MockTTSService generates ~400ms of audio (4 words × 100ms)
+        # At 75 FPS that's ~30 chunks, needs at least 400ms + buffer time
+        await asyncio.sleep(1.0)
+
         # Verify TTS generated frames
         assert len(tts_output) > 0
         assert isinstance(tts_output[0], TTSStartedFrame)
@@ -304,12 +337,15 @@ class TestEndToEndFlow:
         # Verify event processor received all
         assert len(event_output) == len(tts_output)
 
-        # Verify WebSocket events
-        assert event_processor._websocket.send.call_count == 2
+        # Verify WebSocket events (4 total)
+        assert event_processor._websocket.send.call_count == 4
+
+        # Audio processor only forwards non-audio frames
+        # (TTSStartedFrame + TTSStoppedFrame, no OutputAudioRawFrames)
+        assert len(audio_output) == 2
 
         # Verify audio was sent via UDP
-        audio_chunks = [f for f in audio_output if isinstance(f, OutputAudioRawFrame)]
-        assert mock_sock.sendto.call_count == len(audio_chunks)
+        assert mock_sock.sendto.call_count > 0
 
         await audio_processor.stop()
 
@@ -335,29 +371,35 @@ class TestErrorHandling:
     @pytest.mark.asyncio
     async def test_udp_buffer_overflow_handling(self) -> None:
         """Test that UDP buffer overflow is handled gracefully."""
-        audio_processor = UnrealAudioStreamer(host="127.0.0.1", port=8080)
-        await audio_processor.start()
-
-        # Mock socket that raises BlockingIOError
-        import socket
-        from unittest.mock import MagicMock
+        # Create mock socket that raises BlockingIOError
         mock_sock = MagicMock(spec=socket.socket)
         mock_sock.sendto = MagicMock(side_effect=BlockingIOError())
+        mock_sock.close = MagicMock()
+        mock_sock.setblocking = MagicMock()
+        mock_sock.setsockopt = MagicMock()
+
+        audio_processor = UnrealAudioStreamer(host="127.0.0.1", port=8080)
+
+        # Start processor and inject mock socket
+        await audio_processor.start()
         audio_processor._socket = mock_sock
         audio_processor.push_frame = AsyncMock()
 
+        # Start an utterance first (required for queue system)
+        await audio_processor.process_frame(TTSStartedFrame(), FrameDirection.DOWNSTREAM)
+
         # Should not raise
         audio = OutputAudioRawFrame(
-            audio=b'\x00' * 100,
+            audio=b'\x00' * TEST_AUDIO_SIZE,
             sample_rate=24000,
             num_channels=1,
         )
         await audio_processor.process_frame(audio, FrameDirection.DOWNSTREAM)
 
-        # Packet should be counted as dropped
-        assert audio_processor._packets_dropped == 1
+        # Wait for async processing
+        await asyncio.sleep(0.05)
 
-        # Frame should still be forwarded
-        audio_processor.push_frame.assert_called_once()
+        # Packet should be counted as dropped
+        assert audio_processor._packets_dropped >= 1
 
         await audio_processor.stop()

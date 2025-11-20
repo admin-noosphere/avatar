@@ -212,10 +212,12 @@ class AvatarPipeline:
                 logger.info("  - Branch A: Direct TTS → Daily transport (audio only)")
 
             # Branch B: Unreal control (if enabled)
+            # Order matters: AudioStreamer buffers and plays, then forwards TTSStoppedFrame
+            # to EventProcessor which sends stop_speaking at the right time
             if self.settings.enable_unreal:
                 unreal_events, unreal_audio = self.create_unreal_processors()
-                branches.append([unreal_events, unreal_audio])
-                logger.info("  - Branch B: Unreal control (WebSocket + UDP)")
+                branches.append([unreal_audio, unreal_events])
+                logger.info("  - Branch B: Unreal control (UDP audio → WebSocket events)")
 
             # Build with ParallelPipeline only if we have multiple branches
             if len(branches) > 1:
@@ -338,7 +340,7 @@ class AvatarPipeline:
             from pipecat.frames.frames import TTSSpeakFrame
             if self.task:
                 await self.task.queue_frames([
-                    TTSSpeakFrame("Bonjour! Je suis Avatar, comment puis-je vous aider?")
+                    TTSSpeakFrame("Bonjour! Je suis Gala, votre assistante de trajet pour voyages interplanétaires. Comment puis-je vous aider aujourd'hui?")
                 ])
 
         @self.transport.event_handler("on_participant_left")
