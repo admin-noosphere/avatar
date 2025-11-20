@@ -435,7 +435,8 @@ class UnrealAudioStreamer(FrameProcessor):
 
         # Timeout for waiting for incomplete utterances to complete
         # If TTSStoppedFrame doesn't arrive within this time, play what we have
-        incomplete_timeout = 2.0  # seconds
+        # Note: ElevenLabs buffer time is typically 2-3 seconds, so use 3.5s
+        incomplete_timeout = 3.5  # seconds
 
         try:
             while True:
