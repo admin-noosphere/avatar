@@ -1,19 +1,15 @@
-"""UnrealAudioStreamer - UDP audio streaming with complete buffer playback.
+"""UnrealAudioStreamer - UDP audio streaming with sequential utterance queue.
 
-This processor accumulates ALL audio chunks from TTS, then plays the complete
-buffer via UDP to ensure coherent audio stream to Audio2Face.
+This processor streams audio chunks immediately as they arrive from TTS,
+managing multiple utterances in a queue for sequential playback.
 
 Flow:
-1. TTSStartedFrame → Create new utterance buffer
-2. OutputAudioRawFrame → Accumulate in buffer (don't send yet)
-3. TTSStoppedFrame → Play ENTIRE buffer via UDP, with WebSocket events
+1. TTSStartedFrame → Create utterance, add to queue. If first → send start events
+2. OutputAudioRawFrame → Stream immediately via UDP to receiving utterance
+3. TTSStoppedFrame → Mark complete, schedule stop events after duration
+4. After duration → Send stop events, start next utterance if any
 
-WebSocket events are sent at the RIGHT time:
-- start_speaking/start_audio_stream → Just before UDP audio
-- end_audio_stream/stop_speaking → Just after UDP audio completes
-
-This ensures Unreal receives complete, uninterrupted audio with exact duration
-and properly synchronized WebSocket control events for Audio2Face.
+This ensures low latency while properly sequencing multiple phrases.
 """
 
 from __future__ import annotations
@@ -52,39 +48,33 @@ UDP_MAX_PACKET_SIZE = 8192  # 8KB chunks for reliable UDP transmission
 
 @dataclass
 class Utterance:
-    """Represents a complete utterance with all its audio data."""
+    """Tracks an utterance being streamed."""
     utterance_id: int
-    audio_data: bytearray = field(default_factory=bytearray)
     sample_rate: int = DEFAULT_SAMPLE_RATE
     num_channels: int = DEFAULT_CHANNELS
+    total_bytes: int = 0
     chunk_count: int = 0
     is_complete: bool = False  # True when TTSStoppedFrame received
+    started_at: float = field(default_factory=time.monotonic)
     direction: FrameDirection = FrameDirection.DOWNSTREAM
-    created_at: float = field(default_factory=time.monotonic)
-    completed_at: float = 0.0
 
     @property
     def audio_duration_ms(self) -> float:
-        """Calculate audio duration in milliseconds from buffer size."""
-        if not self.audio_data:
+        """Calculate audio duration in milliseconds from total bytes."""
+        if not self.total_bytes:
             return 0.0
         bytes_per_sample = BYTES_PER_SAMPLE * self.num_channels
-        samples = len(self.audio_data) / bytes_per_sample
+        samples = self.total_bytes / bytes_per_sample
         return (samples / self.sample_rate) * 1000
-
-    @property
-    def audio_bytes(self) -> int:
-        """Total bytes in buffer."""
-        return len(self.audio_data)
 
 
 class UnrealAudioStreamer(FrameProcessor):
-    """Processor that buffers complete TTS audio then streams via UDP.
+    """Processor that streams TTS audio immediately via UDP with queue management.
 
     Key behavior:
-    - Accumulates ALL audio chunks until TTSStoppedFrame
-    - Only then sends complete audio via UDP
-    - Ensures coherent stream with exact duration for Unreal animations
+    - Streams audio chunks immediately as they arrive (low latency)
+    - Manages queue of utterances for sequential playback
+    - Sends start/stop events at correct times for Audio2Face sync
     """
 
     def __init__(
@@ -92,7 +82,6 @@ class UnrealAudioStreamer(FrameProcessor):
         host: str = "192.168.1.14",
         port: int = 8080,
         websocket_uri: str = "ws://192.168.1.14:8765",
-        playback_speed: float = 1.0,  # For simulating real-time playback
         **kwargs: Any,
     ) -> None:
         """Initialize the UnrealAudioStreamer.
@@ -101,7 +90,6 @@ class UnrealAudioStreamer(FrameProcessor):
             host: UDP target host for Audio2Face.
             port: UDP target port for Audio2Face.
             websocket_uri: WebSocket URI for Unreal Engine events.
-            playback_speed: Speed multiplier for UDP sending (1.0 = real-time).
             **kwargs: Additional arguments passed to FrameProcessor.
         """
         super().__init__(**kwargs)
@@ -109,7 +97,6 @@ class UnrealAudioStreamer(FrameProcessor):
         self.port = port
         self.websocket_uri = websocket_uri
         self._target = (host, port)
-        self._playback_speed = playback_speed
 
         self._socket: socket.socket | None = None
 
@@ -122,20 +109,14 @@ class UnrealAudioStreamer(FrameProcessor):
         self._total_bytes_sent = 0
         self._total_packets_sent = 0
         self._total_packets_dropped = 0
-        self._total_utterances_completed = 0
+        self._total_utterances = 0
 
-        # Utterance management
+        # Utterance queue management
         self._utterance_counter: int = 0
-        self._current_utterance: Utterance | None = None
         self._utterance_queue: list[Utterance] = []
 
-        # Playback task
-        self._playback_task: asyncio.Task | None = None
-        self._is_playing: bool = False
-
-        # Debug history (last N utterances)
-        self._utterance_history: list[dict] = []
-        self._max_history = 20
+        # Task to send stop events after audio duration
+        self._stop_events_task: asyncio.Task | None = None
 
     async def start(self) -> None:
         """Start the processor, create UDP socket, and connect WebSocket."""
@@ -153,11 +134,9 @@ class UnrealAudioStreamer(FrameProcessor):
         self._total_bytes_sent = 0
         self._total_packets_sent = 0
         self._total_packets_dropped = 0
-        self._total_utterances_completed = 0
+        self._total_utterances = 0
         self._utterance_counter = 0
-        self._current_utterance = None
         self._utterance_queue = []
-        self._is_playing = False
 
         # Start WebSocket connection
         self._ws_running = True
@@ -167,14 +146,14 @@ class UnrealAudioStreamer(FrameProcessor):
 
     async def stop(self) -> None:
         """Stop the processor and close connections."""
-        # Cancel any playback task
-        if self._playback_task:
-            self._playback_task.cancel()
+        # Cancel stop events task
+        if self._stop_events_task:
+            self._stop_events_task.cancel()
             try:
-                await self._playback_task
+                await self._stop_events_task
             except asyncio.CancelledError:
                 pass
-            self._playback_task = None
+            self._stop_events_task = None
 
         # Stop WebSocket
         self._ws_running = False
@@ -197,7 +176,7 @@ class UnrealAudioStreamer(FrameProcessor):
 
         logger.info(
             f"🎙️ UnrealAudioStreamer stopped | "
-            f"Utterances: {self._total_utterances_completed} | "
+            f"Utterances: {self._total_utterances} | "
             f"Packets: {self._total_packets_sent} | "
             f"Dropped: {self._total_packets_dropped} | "
             f"Total: {self._total_bytes_sent / 1024:.1f} KB"
@@ -255,7 +234,7 @@ class UnrealAudioStreamer(FrameProcessor):
         try:
             message = json.dumps(data)
             await self._websocket.send(message)
-            logger.debug(f"📤 Sent to Unreal: {message}")
+            logger.info(f"📤 WS → Unreal: {message}")
             return True
         except ConnectionClosed:
             logger.warning("Cannot send: WebSocket connection closed")
@@ -277,7 +256,7 @@ class UnrealAudioStreamer(FrameProcessor):
         await super().process_frame(frame, direction)
 
         # ═══════════════════════════════════════════════════════════════
-        # 1. TTSStartedFrame → Create new utterance buffer
+        # 1. TTSStartedFrame → Create utterance, add to queue
         # ═══════════════════════════════════════════════════════════════
         if isinstance(frame, TTSStartedFrame):
             self._utterance_counter += 1
@@ -289,67 +268,78 @@ class UnrealAudioStreamer(FrameProcessor):
             # Add to queue
             self._utterance_queue.append(utterance)
 
+            is_first = len(self._utterance_queue) == 1
+
             logger.info(
                 f"📝 Utterance #{utterance.utterance_id} created | "
-                f"Queue size: {len(self._utterance_queue)}"
+                f"Queue size: {len(self._utterance_queue)} | "
+                f"First: {is_first}"
             )
+
+            # If this is the first utterance, send start events
+            if is_first:
+                await self._send_ws_command({
+                    "type": "start_speaking",
+                    "category": "SPEAKING_NEUTRAL",
+                    "timestamp": time.time(),
+                })
+                await self._send_ws_command({
+                    "type": "start_audio_stream",
+                    "timestamp": time.time(),
+                })
 
             # Forward the frame
             await self.push_frame(frame, direction)
 
         # ═══════════════════════════════════════════════════════════════
-        # 2. OutputAudioRawFrame → Accumulate in buffer (DON'T SEND YET)
+        # 2. OutputAudioRawFrame → Stream immediately via UDP
         # ═══════════════════════════════════════════════════════════════
         elif isinstance(frame, OutputAudioRawFrame):
             audio_data = frame.audio
             audio_len = len(audio_data)
-            sample_rate = frame.sample_rate or DEFAULT_SAMPLE_RATE
-            num_channels = frame.num_channels or DEFAULT_CHANNELS
 
-            # Find the utterance to add audio to
-            # Priority: last incomplete one, or first complete one still in queue (being played)
-            target = None
-
-            # First try to find an incomplete utterance
+            # Find the utterance still receiving (last incomplete one)
+            receiving_utterance = None
             for utt in reversed(self._utterance_queue):
                 if not utt.is_complete:
-                    target = utt
+                    receiving_utterance = utt
                     break
 
-            # If no incomplete, use the first one in queue (being played)
-            if not target and self._utterance_queue:
-                target = self._utterance_queue[0]
-
-            if target:
+            if receiving_utterance:
                 # Update sample rate/channels from first chunk
-                if target.chunk_count == 0:
-                    target.sample_rate = sample_rate
-                    target.num_channels = num_channels
+                if receiving_utterance.chunk_count == 0:
+                    receiving_utterance.sample_rate = frame.sample_rate or DEFAULT_SAMPLE_RATE
+                    receiving_utterance.num_channels = frame.num_channels or DEFAULT_CHANNELS
 
-                # Accumulate audio
-                target.audio_data.extend(audio_data)
-                target.chunk_count += 1
+                # Track total bytes for duration calculation
+                receiving_utterance.total_bytes += audio_len
+                receiving_utterance.chunk_count += 1
+
+                # Stream immediately via UDP
+                packets_sent = 0
+                for i in range(0, audio_len, UDP_MAX_PACKET_SIZE):
+                    chunk = audio_data[i:i + UDP_MAX_PACKET_SIZE]
+                    if self._send_udp_packet(chunk):
+                        packets_sent += 1
+                        self._total_packets_sent += 1
+                        self._total_bytes_sent += len(chunk)
+                    else:
+                        self._total_packets_dropped += 1
 
                 logger.debug(
-                    f"🔊 Utterance #{target.utterance_id} chunk {target.chunk_count}: "
-                    f"+{audio_len} bytes | "
-                    f"Total: {target.audio_bytes} bytes ({target.audio_duration_ms:.0f}ms)"
+                    f"🔊 Utt#{receiving_utterance.utterance_id} chunk #{receiving_utterance.chunk_count}: "
+                    f"{audio_len} bytes → {packets_sent} UDP | "
+                    f"Total: {receiving_utterance.total_bytes} bytes "
+                    f"({receiving_utterance.audio_duration_ms:.0f}ms)"
                 )
-
-                # Start playback task if not running (will wait for complete or timeout)
-                if not self._is_playing and not self._playback_task:
-                    self._playback_task = asyncio.create_task(self._play_queue())
             else:
-                logger.warning(
-                    f"⚠️ Audio chunk received but no active utterance! "
-                    f"({audio_len} bytes dropped)"
-                )
+                logger.warning(f"⚠️ Audio chunk received but no receiving utterance! ({audio_len} bytes dropped)")
 
         # ═══════════════════════════════════════════════════════════════
-        # 3. TTSStoppedFrame → Mark complete, start playback if not playing
+        # 3. TTSStoppedFrame → Mark complete, schedule stop events
         # ═══════════════════════════════════════════════════════════════
         elif isinstance(frame, TTSStoppedFrame):
-            # Find the utterance to complete (first incomplete one)
+            # Find the first incomplete utterance
             target = None
             for utt in self._utterance_queue:
                 if not utt.is_complete:
@@ -358,54 +348,52 @@ class UnrealAudioStreamer(FrameProcessor):
 
             if target:
                 target.is_complete = True
-                target.completed_at = time.monotonic()
 
-                buffer_time = (target.completed_at - target.created_at) * 1000
+                # Calculate timing
+                elapsed_ms = (time.monotonic() - target.started_at) * 1000
+                remaining_ms = target.audio_duration_ms - elapsed_ms
 
                 logger.info(
                     f"✅ Utterance #{target.utterance_id} complete | "
                     f"Chunks: {target.chunk_count} | "
-                    f"Size: {target.audio_bytes} bytes | "
+                    f"Size: {target.total_bytes} bytes | "
                     f"Duration: {target.audio_duration_ms:.0f}ms | "
-                    f"Buffer time: {buffer_time:.0f}ms"
+                    f"Remaining: {max(0, remaining_ms):.0f}ms | "
+                    f"Queue: {len(self._utterance_queue)}"
                 )
 
-                # Save to history for debugging
-                self._save_to_history(target)
+                self._total_utterances += 1
 
-                # Start playback if not already playing
-                if not self._is_playing:
-                    self._playback_task = asyncio.create_task(
-                        self._play_queue()
+                # Check if this is the first in queue (currently playing)
+                if self._utterance_queue and self._utterance_queue[0] == target:
+                    # Cancel any existing stop task
+                    if self._stop_events_task:
+                        self._stop_events_task.cancel()
+
+                    # Schedule stop events after remaining duration
+                    self._stop_events_task = asyncio.create_task(
+                        self._finish_utterance(target, max(0, remaining_ms))
                     )
             else:
-                logger.warning("⚠️ TTSStoppedFrame but no incomplete utterance found")
+                logger.warning("⚠️ TTSStoppedFrame but no incomplete utterance")
                 await self.push_frame(frame, direction)
 
         # ═══════════════════════════════════════════════════════════════
-        # 4. Interruption → Cancel everything and stop audio
+        # 4. Interruption → Cancel everything and stop immediately
         # ═══════════════════════════════════════════════════════════════
         elif isinstance(frame, (InterruptionFrame, CancelFrame)):
-            # Log what we're canceling
-            pending = [u for u in self._utterance_queue if not u.is_complete]
-            complete = [u for u in self._utterance_queue if u.is_complete]
+            queue_size = len(self._utterance_queue)
+            logger.info(f"🛑 INTERRUPTION | Queue size: {queue_size}")
 
-            logger.info(
-                f"🛑 INTERRUPTION | "
-                f"Canceling {len(pending)} pending + {len(complete)} complete utterances | "
-                f"Was playing: {self._is_playing}"
-            )
+            # Cancel pending stop events
+            if self._stop_events_task:
+                self._stop_events_task.cancel()
+                self._stop_events_task = None
 
-            # Cancel playback task (don't await - let it cancel in background)
-            if self._playback_task:
-                self._playback_task.cancel()
-                self._playback_task = None
-
-            # Clear ALL queued utterances
+            # Clear queue
             self._utterance_queue = []
-            self._is_playing = False
 
-            # Send stop events via WebSocket immediately
+            # Send stop events immediately
             await self._send_ws_command({
                 "type": "end_audio_stream",
                 "timestamp": time.time(),
@@ -414,177 +402,87 @@ class UnrealAudioStreamer(FrameProcessor):
                 "type": "stop_speaking",
                 "timestamp": time.time(),
             })
-            logger.info("✅ Interruption: stop events sent")
+            logger.info("✅ Interruption: stop events sent, queue cleared")
 
             # Forward interruption downstream
             await self.push_frame(frame, direction)
 
         # ═══════════════════════════════════════════════════════════════
-        # 5. Other frames → Pass through (with debug for system frames)
+        # 5. Other frames → Pass through
         # ═══════════════════════════════════════════════════════════════
         else:
             frame_name = type(frame).__name__
-            # Log system/control frames for debugging
             if "Interrupt" in frame_name or "Cancel" in frame_name or "Stop" in frame_name:
                 logger.info(f"🔍 Frame passthrough: {frame_name}")
             await self.push_frame(frame, direction)
 
-    async def _play_queue(self) -> None:
-        """Play all complete utterances in the queue sequentially."""
-        self._is_playing = True
-
-        # Timeout for waiting for incomplete utterances to complete
-        # If TTSStoppedFrame doesn't arrive within this time, play what we have
-        # Note: ElevenLabs buffer time is typically 2-3 seconds, so use 3.5s
-        incomplete_timeout = 3.5  # seconds
-
-        try:
-            while True:
-                # Find next complete utterance (don't pop yet - keep for late chunks)
-                utterance = None
-                utterance_index = -1
-                for i, utt in enumerate(self._utterance_queue):
-                    if utt.is_complete:
-                        utterance = utt
-                        utterance_index = i
-                        break
-
-                if not utterance:
-                    # No complete utterance, check for incomplete ones that timed out
-                    now = time.monotonic()
-                    for i, utt in enumerate(self._utterance_queue):
-                        if not utt.is_complete and utt.audio_data:
-                            # Check if this utterance has been waiting too long
-                            wait_time = now - utt.created_at
-                            if wait_time > incomplete_timeout:
-                                # Play it anyway - TTSStoppedFrame probably won't come
-                                logger.warning(
-                                    f"⚠️ Utterance #{utt.utterance_id} incomplete after {wait_time:.1f}s, "
-                                    f"playing {utt.audio_bytes} bytes anyway"
-                                )
-                                utt.is_complete = True
-                                utt.completed_at = now
-                                utterance = utt
-                                utterance_index = i
-                                break
-
-                if not utterance:
-                    # Still no utterance to play, wait a bit
-                    await asyncio.sleep(0.05)
-
-                    # Check if queue is empty
-                    if not self._utterance_queue:
-                        break
-                    continue
-
-                # Play this utterance
-                await self._play_utterance(utterance)
-
-                # NOW remove from queue after playback is done
-                if utterance_index >= 0 and utterance_index < len(self._utterance_queue):
-                    self._utterance_queue.pop(utterance_index)
-
-        except asyncio.CancelledError:
-            logger.debug("🛑 Playback cancelled")
-            raise
-        finally:
-            self._is_playing = False
-
-    async def _play_utterance(self, utterance: Utterance) -> None:
-        """Play a single utterance via UDP with WebSocket events.
+    async def _finish_utterance(self, utterance: Utterance, delay_ms: float) -> None:
+        """Finish an utterance: wait for audio, send stop events, start next.
 
         Args:
-            utterance: The complete utterance to play.
+            utterance: The utterance that finished receiving.
+            delay_ms: Milliseconds to wait for audio to finish playing.
         """
-        if not utterance.audio_data:
-            logger.warning(f"⚠️ Utterance #{utterance.utterance_id} has no audio data!")
-            # Still forward the stop frame
+        try:
+            # Wait for audio to finish playing
+            if delay_ms > 0:
+                logger.debug(f"⏳ Waiting {delay_ms:.0f}ms for utterance #{utterance.utterance_id} to finish...")
+                await asyncio.sleep(delay_ms / 1000)
+
+            # Remove from queue
+            if self._utterance_queue and self._utterance_queue[0] == utterance:
+                self._utterance_queue.pop(0)
+
+            # Check if there's a next utterance
+            has_next = len(self._utterance_queue) > 0
+            next_id = self._utterance_queue[0].utterance_id if has_next else None
+
+            # Send stop events
+            await self._send_ws_command({
+                "type": "end_audio_stream",
+                "timestamp": time.time(),
+            })
+            await self._send_ws_command({
+                "type": "stop_speaking",
+                "timestamp": time.time(),
+            })
+
+            logger.info(
+                f"⏹️ Utterance #{utterance.utterance_id} done | "
+                f"Next: {next_id if has_next else 'None'} | "
+                f"Queue: {len(self._utterance_queue)}"
+            )
+
+            # Forward TTSStoppedFrame
             await self.push_frame(TTSStoppedFrame(), utterance.direction)
-            return
 
-        start_time = time.monotonic()
-        audio_data = bytes(utterance.audio_data)
-        total_bytes = len(audio_data)
+            # If there's a next utterance, send start events for it
+            if has_next:
+                next_utt = self._utterance_queue[0]
 
-        logger.info(
-            f"▶️ Playing utterance #{utterance.utterance_id} | "
-            f"{total_bytes} bytes | "
-            f"{utterance.audio_duration_ms:.0f}ms | "
-            f"{utterance.chunk_count} chunks"
-        )
+                await self._send_ws_command({
+                    "type": "start_speaking",
+                    "category": "SPEAKING_NEUTRAL",
+                    "timestamp": time.time(),
+                })
+                await self._send_ws_command({
+                    "type": "start_audio_stream",
+                    "timestamp": time.time(),
+                })
 
-        # ═══════════════════════════════════════════════════════════════
-        # SEND START EVENTS - Just before UDP audio
-        # ═══════════════════════════════════════════════════════════════
-        if await self._send_ws_command({
-            "type": "start_speaking",
-            "category": "SPEAKING_NEUTRAL",
-            "timestamp": time.time(),
-        }):
-            logger.info("✅ start_speaking sent (just before UDP)")
+                logger.info(f"▶️ Starting next utterance #{next_utt.utterance_id}")
 
-        if await self._send_ws_command({
-            "type": "start_audio_stream",
-            "timestamp": time.time(),
-        }):
-            logger.info("✅ start_audio_stream sent (just before UDP)")
+                # If next utterance is already complete, schedule its finish
+                if next_utt.is_complete:
+                    elapsed_ms = (time.monotonic() - next_utt.started_at) * 1000
+                    remaining_ms = next_utt.audio_duration_ms - elapsed_ms
+                    self._stop_events_task = asyncio.create_task(
+                        self._finish_utterance(next_utt, max(0, remaining_ms))
+                    )
 
-        # Send audio in UDP packets
-        packets_sent = 0
-        bytes_sent = 0
-        packets_dropped = 0
-
-        for i in range(0, total_bytes, UDP_MAX_PACKET_SIZE):
-            chunk = audio_data[i:i + UDP_MAX_PACKET_SIZE]
-
-            if self._send_udp_packet(chunk):
-                packets_sent += 1
-                bytes_sent += len(chunk)
-            else:
-                packets_dropped += 1
-
-        # Calculate actual send time
-        send_time = (time.monotonic() - start_time) * 1000
-
-        # Wait for audio duration to complete (simulate real-time playback)
-        # This ensures stop_speaking is sent at the right time
-        remaining_ms = utterance.audio_duration_ms - send_time
-        if remaining_ms > 0:
-            await asyncio.sleep(remaining_ms / 1000)
-
-        # Update stats
-        self._total_bytes_sent += bytes_sent
-        self._total_packets_sent += packets_sent
-        self._total_packets_dropped += packets_dropped
-        self._total_utterances_completed += 1
-
-        elapsed = (time.monotonic() - start_time) * 1000
-
-        logger.info(
-            f"⏹️ Utterance #{utterance.utterance_id} finished | "
-            f"Packets: {packets_sent} sent, {packets_dropped} dropped | "
-            f"Bytes: {bytes_sent} | "
-            f"Expected: {utterance.audio_duration_ms:.0f}ms | "
-            f"Actual: {elapsed:.0f}ms"
-        )
-
-        # ═══════════════════════════════════════════════════════════════
-        # SEND STOP EVENTS - Just after UDP audio completes
-        # ═══════════════════════════════════════════════════════════════
-        if await self._send_ws_command({
-            "type": "end_audio_stream",
-            "timestamp": time.time(),
-        }):
-            logger.info("✅ end_audio_stream sent (after UDP complete)")
-
-        if await self._send_ws_command({
-            "type": "stop_speaking",
-            "timestamp": time.time(),
-        }):
-            logger.info("✅ stop_speaking sent (after UDP complete)")
-
-        # Forward the stop frame downstream
-        await self.push_frame(TTSStoppedFrame(), utterance.direction)
+        except asyncio.CancelledError:
+            logger.debug(f"⏹️ Finish cancelled for utterance #{utterance.utterance_id}")
+            raise
 
     def _send_udp_packet(self, data: bytes) -> bool:
         """Send a single UDP packet.
@@ -614,83 +512,29 @@ class UnrealAudioStreamer(FrameProcessor):
 
         return False
 
-    def _save_to_history(self, utterance: Utterance) -> None:
-        """Save utterance info to debug history.
-
-        Args:
-            utterance: The utterance to save.
-        """
-        info = {
-            "id": utterance.utterance_id,
-            "chunks": utterance.chunk_count,
-            "bytes": utterance.audio_bytes,
-            "duration_ms": utterance.audio_duration_ms,
-            "sample_rate": utterance.sample_rate,
-            "channels": utterance.num_channels,
-            "buffer_time_ms": (utterance.completed_at - utterance.created_at) * 1000,
-            "timestamp": time.strftime("%H:%M:%S"),
-        }
-
-        self._utterance_history.append(info)
-
-        # Keep only last N
-        if len(self._utterance_history) > self._max_history:
-            self._utterance_history.pop(0)
-
     def get_stats(self) -> dict[str, Any]:
-        """Get comprehensive streaming statistics.
+        """Get streaming statistics.
 
         Returns:
-            Dictionary with all stats and recent utterance history.
+            Dictionary with stats.
         """
         return {
-            "total": {
-                "utterances_completed": self._total_utterances_completed,
-                "packets_sent": self._total_packets_sent,
-                "packets_dropped": self._total_packets_dropped,
-                "bytes_sent": self._total_bytes_sent,
-                "kb_sent": self._total_bytes_sent / 1024,
-            },
-            "current": {
-                "queue_size": len(self._utterance_queue),
-                "is_playing": self._is_playing,
-                "pending_utterances": [
-                    {
-                        "id": u.utterance_id,
-                        "bytes": u.audio_bytes,
-                        "duration_ms": u.audio_duration_ms,
-                        "complete": u.is_complete,
-                    }
-                    for u in self._utterance_queue
-                ],
-            },
-            "history": self._utterance_history,
+            "total_utterances": self._total_utterances,
+            "total_packets_sent": self._total_packets_sent,
+            "total_packets_dropped": self._total_packets_dropped,
+            "total_bytes_sent": self._total_bytes_sent,
+            "total_kb_sent": self._total_bytes_sent / 1024,
+            "queue_size": len(self._utterance_queue),
+            "queue": [
+                {
+                    "id": u.utterance_id,
+                    "bytes": u.total_bytes,
+                    "duration_ms": u.audio_duration_ms,
+                    "complete": u.is_complete,
+                }
+                for u in self._utterance_queue
+            ],
         }
-
-    def print_stats(self) -> None:
-        """Print formatted statistics to logger."""
-        stats = self.get_stats()
-
-        logger.info("=" * 60)
-        logger.info("  UnrealAudioStreamer Statistics")
-        logger.info("=" * 60)
-        logger.info(f"  Utterances completed: {stats['total']['utterances_completed']}")
-        logger.info(f"  Packets sent: {stats['total']['packets_sent']}")
-        logger.info(f"  Packets dropped: {stats['total']['packets_dropped']}")
-        logger.info(f"  Total bytes: {stats['total']['bytes_sent']} ({stats['total']['kb_sent']:.1f} KB)")
-        logger.info(f"  Queue size: {stats['current']['queue_size']}")
-        logger.info(f"  Is playing: {stats['current']['is_playing']}")
-
-        if stats['history']:
-            logger.info("-" * 60)
-            logger.info("  Recent Utterances:")
-            for h in stats['history'][-5:]:
-                logger.info(
-                    f"    #{h['id']}: {h['chunks']} chunks, "
-                    f"{h['bytes']} bytes, {h['duration_ms']:.0f}ms, "
-                    f"buffered in {h['buffer_time_ms']:.0f}ms"
-                )
-        logger.info("=" * 60)
 
     @property
     def is_streaming(self) -> bool:
