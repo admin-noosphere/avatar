@@ -213,12 +213,12 @@ class AvatarPipeline:
                 logger.info("  - Branch A: Direct TTS → Daily transport (audio only)")
 
             # Branch B: Unreal control (if enabled)
-            # Order matters: AudioStreamer buffers and plays, then forwards TTSStoppedFrame
-            # to EventProcessor which sends stop_speaking at the right time
+            # UnrealAudioStreamer handles both UDP audio AND WebSocket events
+            # (UnrealEventProcessor removed - it was competing for the same WebSocket connection)
             if self.settings.enable_unreal:
                 unreal_events, unreal_audio = self.create_unreal_processors()
-                branches.append([unreal_audio, unreal_events])
-                logger.info("  - Branch B: Unreal control (UDP audio → WebSocket events)")
+                branches.append([unreal_audio])  # Only AudioStreamer - it handles WebSocket events now
+                logger.info("  - Branch B: Unreal control (UDP audio + WebSocket events)")
 
             # Build with ParallelPipeline only if we have multiple branches
             if len(branches) > 1:
@@ -328,14 +328,12 @@ class AvatarPipeline:
                 await self.ndi_processor.start_ndi()
                 logger.info("NDI started - Video + Audio streaming")
 
-            # Start Unreal processors (if enabled)
+            # Start Unreal audio streamer (if enabled)
+            # Note: UnrealAudioStreamer now handles both UDP audio AND WebSocket events
             if self.settings.enable_unreal:
-                if self.unreal_events:
-                    await self.unreal_events.start()
-                    logger.info(f"Unreal WebSocket started → {self.settings.unreal_websocket_uri}")
                 if self.unreal_audio:
                     await self.unreal_audio.start()
-                    logger.info(f"Unreal audio streamer started → {self.settings.unreal_audio_udp_host}:{self.settings.unreal_audio_udp_port}")
+                    logger.info(f"Unreal audio streamer started → UDP {self.settings.unreal_audio_udp_host}:{self.settings.unreal_audio_udp_port}, WS {self.settings.unreal_websocket_uri}")
 
             # Send welcome message
             from pipecat.frames.frames import TTSSpeakFrame
