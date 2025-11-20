@@ -10,6 +10,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import time
 from typing import Any
 
 import websockets
@@ -68,7 +69,7 @@ class UnrealEventProcessor(FrameProcessor):
         """Start the processor and initiate WebSocket connection."""
         self._running = True
         self._connection_task = asyncio.create_task(self._maintain_connection())
-        logger.info(f"UnrealEventProcessor started, connecting to {self.uri}")
+        logger.info(f"🔌 UnrealEventProcessor started, connecting to {self.uri}")
 
     async def stop(self) -> None:
         """Stop the processor and close WebSocket connection."""
@@ -99,7 +100,7 @@ class UnrealEventProcessor(FrameProcessor):
                 ) as ws:
                     self._websocket = ws
                     self._current_delay = self.reconnect_delay  # Reset backoff
-                    logger.info(f"Connected to Unreal Engine at {self.uri}")
+                    logger.info(f"✅ Connected to Unreal Engine at {self.uri}")
 
                     # Wait until connection closes
                     await ws.wait_closed()
@@ -135,23 +136,55 @@ class UnrealEventProcessor(FrameProcessor):
         """
         await super().process_frame(frame, direction)
 
+        # Log all frames for debugging
+        frame_type = type(frame).__name__
+        if frame_type in ['TTSStartedFrame', 'TTSStoppedFrame', 'OutputAudioRawFrame']:
+            logger.info(f"UnrealEventProcessor received: {frame_type}")
+
         # Handle TTS Started - Avatar starts speaking
         if isinstance(frame, TTSStartedFrame):
+            # Send start_speaking with category and timestamp
             await self._send_command({
                 "type": "start_speaking",
                 "category": "SPEAKING_NEUTRAL",
+                "timestamp": time.time(),
             })
-            logger.debug("Sent start_speaking command")
+            logger.info("Sent start_speaking command")
+
+            # Send start_audio_stream
+            await self._send_command({
+                "type": "start_audio_stream",
+                "timestamp": time.time(),
+            })
+            logger.info("Sent start_audio_stream command")
 
         # Handle TTS Stopped - Avatar stops speaking
         elif isinstance(frame, TTSStoppedFrame):
-            await self._send_command({"type": "stop_speaking"})
-            logger.debug("Sent stop_speaking command")
+            # Send end_audio_stream
+            await self._send_command({
+                "type": "end_audio_stream",
+                "timestamp": time.time(),
+            })
+            logger.info("Sent end_audio_stream command")
+
+            # Send stop_speaking
+            await self._send_command({
+                "type": "stop_speaking",
+                "timestamp": time.time(),
+            })
+            logger.info("Sent stop_speaking command")
 
         # Handle User Interruption (barge-in) - Immediately stop avatar
         elif isinstance(frame, StartInterruptionFrame):
-            await self._send_command({"type": "stop_speaking"})
-            logger.debug("Sent stop_speaking command (interruption)")
+            await self._send_command({
+                "type": "end_audio_stream",
+                "timestamp": time.time(),
+            })
+            await self._send_command({
+                "type": "stop_speaking",
+                "timestamp": time.time(),
+            })
+            logger.info("Sent stop commands (interruption)")
 
         # Forward frame downstream
         await self.push_frame(frame, direction)
@@ -163,13 +196,13 @@ class UnrealEventProcessor(FrameProcessor):
             data: Dictionary to serialize and send as JSON.
         """
         if not self._websocket:
-            logger.warning("Cannot send command: WebSocket not connected")
+            logger.warning(f"Cannot send command: WebSocket not connected (trying to send: {data.get('type')})")
             return
 
         try:
             message = json.dumps(data)
             await self._websocket.send(message)
-            logger.debug(f"Sent to Unreal: {message}")
+            logger.info(f"✅ Sent to Unreal: {message}")
         except ConnectionClosed:
             logger.warning("Cannot send: connection closed")
             self._websocket = None

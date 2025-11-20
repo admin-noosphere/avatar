@@ -325,10 +325,14 @@ class AvatarPipeline:
                 await self.ndi_processor.start_ndi()
                 logger.info("NDI started - Video + Audio streaming")
 
-            # Start Unreal audio streamer (if enabled)
-            if self.settings.enable_unreal and self.unreal_audio:
-                await self.unreal_audio.start()
-                logger.info("Unreal audio streamer started")
+            # Start Unreal processors (if enabled)
+            if self.settings.enable_unreal:
+                if self.unreal_events:
+                    await self.unreal_events.start()
+                    logger.info(f"Unreal WebSocket started → {self.settings.unreal_websocket_uri}")
+                if self.unreal_audio:
+                    await self.unreal_audio.start()
+                    logger.info(f"Unreal audio streamer started → {self.settings.unreal_audio_udp_host}:{self.settings.unreal_audio_udp_port}")
 
             # Send welcome message
             from pipecat.frames.frames import TTSSpeakFrame

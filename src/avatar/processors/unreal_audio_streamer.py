@@ -3,6 +3,9 @@
 This processor receives OutputAudioRawFrame frames and streams the raw PCM
 audio data via UDP to NVIDIA Audio2Face for real-time lip-sync animation
 on MetaHuman avatars.
+
+Audio must be sent in chunks of 640 bytes (320 samples @ 16-bit) at 75 FPS
+(13.33ms per chunk) for proper lip-sync synchronization.
 """
 
 from __future__ import annotations
@@ -10,12 +13,18 @@ from __future__ import annotations
 import asyncio
 import logging
 import socket
+import time
 from typing import Any
 
 from pipecat.frames.frames import Frame, OutputAudioRawFrame
 from pipecat.processors.frame_processor import FrameDirection, FrameProcessor
 
 logger = logging.getLogger(__name__)
+
+# Audio2Face chunking constants
+CHUNK_SIZE_SAMPLES = 320  # 320 samples per chunk
+CHUNK_SIZE_BYTES = CHUNK_SIZE_SAMPLES * 2  # 640 bytes (16-bit samples)
+CHUNK_DELAY = 0.01333  # 13.33ms = 75 FPS
 
 
 class UnrealAudioStreamer(FrameProcessor):
@@ -52,6 +61,9 @@ class UnrealAudioStreamer(FrameProcessor):
         self._bytes_sent = 0
         self._packets_sent = 0
         self._packets_dropped = 0
+        self._buffer = bytearray()  # Buffer for chunking
+        self._stream_task: asyncio.Task | None = None
+        self._audio_queue: asyncio.Queue | None = None
 
     async def start(self) -> None:
         """Start the processor and create UDP socket."""
@@ -69,13 +81,41 @@ class UnrealAudioStreamer(FrameProcessor):
         self._bytes_sent = 0
         self._packets_sent = 0
         self._packets_dropped = 0
+        self._buffer = bytearray()
+
+        # Create audio queue for rate-controlled streaming
+        self._audio_queue = asyncio.Queue()
+        self._stream_task = asyncio.create_task(self._stream_audio_loop())
 
         logger.info(
-            f"UnrealAudioStreamer started, streaming to {self.host}:{self.port}"
+            f"UnrealAudioStreamer started, streaming to {self.host}:{self.port} "
+            f"(chunk_size={CHUNK_SIZE_BYTES} bytes @ {1/CHUNK_DELAY:.0f} FPS)"
         )
 
     async def stop(self) -> None:
         """Stop the processor and close UDP socket."""
+        # Stop streaming task
+        if self._stream_task:
+            self._stream_task.cancel()
+            try:
+                await self._stream_task
+            except asyncio.CancelledError:
+                pass
+            self._stream_task = None
+
+        # Flush remaining buffer
+        if self._buffer and self._socket:
+            # Pad to chunk size if needed
+            if len(self._buffer) > 0:
+                padding = CHUNK_SIZE_BYTES - (len(self._buffer) % CHUNK_SIZE_BYTES)
+                if padding < CHUNK_SIZE_BYTES:
+                    self._buffer.extend(b'\x00' * padding)
+                # Send remaining chunks
+                while len(self._buffer) >= CHUNK_SIZE_BYTES:
+                    chunk = bytes(self._buffer[:CHUNK_SIZE_BYTES])
+                    self._buffer = self._buffer[CHUNK_SIZE_BYTES:]
+                    self._send_chunk(chunk)
+
         if self._socket:
             self._socket.close()
             self._socket = None
@@ -99,28 +139,84 @@ class UnrealAudioStreamer(FrameProcessor):
         await super().process_frame(frame, direction)
 
         if isinstance(frame, OutputAudioRawFrame):
+            logger.info(f"Received audio frame: {len(frame.audio)} bytes")
             await self._send_audio(frame.audio)
 
         # Forward frame downstream (for any subsequent processors)
         await self.push_frame(frame, direction)
 
     async def _send_audio(self, audio_data: bytes) -> None:
-        """Send raw audio bytes via UDP.
+        """Buffer audio and queue chunks for rate-controlled streaming.
 
-        Uses non-blocking socket to prevent pipeline stalls. Packets are
-        dropped under extreme load to maintain real-time behavior.
+        Audio is buffered and sent in 640-byte chunks at 75 FPS for
+        proper Audio2Face lip-sync synchronization.
 
         Args:
-            audio_data: Raw PCM audio bytes to send.
+            audio_data: Raw PCM audio bytes to buffer.
+        """
+        if not self._audio_queue:
+            logger.warning("Cannot send audio: queue not initialized")
+            return
+
+        # Add to buffer
+        self._buffer.extend(audio_data)
+
+        # Log first audio received
+        if self._packets_sent == 0 and len(self._buffer) >= CHUNK_SIZE_BYTES:
+            logger.info(f"First audio received: {len(audio_data)} bytes, buffer now {len(self._buffer)} bytes")
+
+        # Queue complete chunks
+        chunks_queued = 0
+        while len(self._buffer) >= CHUNK_SIZE_BYTES:
+            chunk = bytes(self._buffer[:CHUNK_SIZE_BYTES])
+            self._buffer = self._buffer[CHUNK_SIZE_BYTES:]
+            await self._audio_queue.put(chunk)
+            chunks_queued += 1
+
+        if chunks_queued > 0:
+            logger.debug(f"Queued {chunks_queued} chunks, queue size: {self._audio_queue.qsize()}")
+
+    async def _stream_audio_loop(self) -> None:
+        """Background task that sends audio chunks at controlled rate (75 FPS)."""
+        last_send_time = time.monotonic()
+
+        while True:
+            try:
+                # Wait for chunk with timeout
+                try:
+                    chunk = await asyncio.wait_for(
+                        self._audio_queue.get(), timeout=0.1
+                    )
+                except asyncio.TimeoutError:
+                    continue
+
+                # Rate control: ensure minimum delay between chunks
+                now = time.monotonic()
+                elapsed = now - last_send_time
+                if elapsed < CHUNK_DELAY:
+                    await asyncio.sleep(CHUNK_DELAY - elapsed)
+
+                # Send chunk
+                self._send_chunk(chunk)
+                last_send_time = time.monotonic()
+
+            except asyncio.CancelledError:
+                break
+            except Exception as e:
+                logger.error(f"Stream loop error: {e}")
+
+    def _send_chunk(self, chunk: bytes) -> None:
+        """Send a single chunk via UDP.
+
+        Args:
+            chunk: 640-byte audio chunk to send.
         """
         if not self._socket:
-            logger.warning("Cannot send audio: socket not initialized")
             return
 
         try:
-            # Non-blocking send
-            self._socket.sendto(audio_data, self._target)
-            self._bytes_sent += len(audio_data)
+            self._socket.sendto(chunk, self._target)
+            self._bytes_sent += len(chunk)
             self._packets_sent += 1
 
             if self._packets_sent % 1000 == 0:
@@ -130,7 +226,6 @@ class UnrealAudioStreamer(FrameProcessor):
                 )
 
         except BlockingIOError:
-            # Socket buffer full - drop packet to maintain real-time
             self._packets_dropped += 1
             if self._packets_dropped % 100 == 0:
                 logger.warning(

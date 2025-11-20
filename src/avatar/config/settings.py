@@ -27,7 +27,7 @@ class Settings(BaseSettings):
     # Unreal Engine Integration
     # =========================================================================
     unreal_websocket_uri: str = Field(
-        default="ws://localhost:8765",
+        default="ws://192.168.1.14:60765",
         description="WebSocket URI for Unreal Engine control",
     )
     unreal_audio_udp_host: str = Field(
