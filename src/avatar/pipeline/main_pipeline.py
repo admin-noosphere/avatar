@@ -207,10 +207,11 @@ class AvatarPipeline:
                 ndi_processor = self.create_ndi_processor()
                 branches.append([ndi_processor, transport.output()])
                 logger.info("  - Branch A: NDI → Daily transport (video + audio)")
-            else:
-                # No NDI - just send TTS audio to Daily
+            elif not self.settings.enable_unreal:
+                # No NDI and no Unreal - send TTS audio to Daily
                 branches.append([transport.output()])
                 logger.info("  - Branch A: Direct TTS → Daily transport (audio only)")
+            # else: When Unreal is enabled, don't send audio to Daily (causes echo)
 
             # Branch B: Unreal control (if enabled)
             # UnrealAudioStreamer handles both UDP audio AND WebSocket events
