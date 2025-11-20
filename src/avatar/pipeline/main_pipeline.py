@@ -79,7 +79,7 @@ class AvatarPipeline:
             self.settings.daily_api_key,
             "Avatar",
             DailyParams(
-                audio_out_enabled=True,
+                audio_out_enabled=False,  # Disable audio to Daily - only UDP to Unreal
                 audio_in_enabled=True,
                 video_out_enabled=True,  # NDI video output
                 camera_out_enabled=True,
@@ -88,10 +88,10 @@ class AvatarPipeline:
                 video_out_framerate=30,
                 vad_analyzer=SileroVADAnalyzer(
                     params=VADParams(
-                        confidence=0.5,
-                        start_secs=0.2,
-                        stop_secs=0.5,
-                        min_volume=0.5,
+                        confidence=0.7,      # Increased from 0.5 - reduces false positives
+                        start_secs=0.8,      # Increased from 0.2 - need 0.8s to interrupt
+                        stop_secs=0.8,       # Increased from 0.5
+                        min_volume=0.6,      # Increased minimum volume threshold
                     )
                 ),
                 vad_audio_passthrough=True,

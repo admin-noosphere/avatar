@@ -48,7 +48,7 @@ def main():
         enable_unreal=True,
         enable_ndi=False,
         # Unreal endpoints - both on 192.168.1.14
-        unreal_websocket_uri="ws://192.168.1.14:9765",
+        unreal_websocket_uri="ws://192.168.1.14:60765",
         unreal_audio_udp_host="192.168.1.14",
         unreal_audio_udp_port=8080,
     )
